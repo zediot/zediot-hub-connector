@@ -1,6 +1,6 @@
 # ZedHub Connector
 
-`ZedHub Connector` is the outbound edge runtime that connects a local
+`ZedHub Connector` is the outbound connector runtime that connects a local
 Home Assistant installation to ZedIoT Core.
 
 ## Release identities

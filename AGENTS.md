@@ -2,7 +2,7 @@
 
 ## Scope
 
-This repository owns the ZedHub Connector edge runtime and its Home Assistant
+This repository owns the ZedHub Connector runtime and its Home Assistant
 and standalone Docker packaging.
 
 ## Boundaries

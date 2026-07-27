@@ -11,7 +11,7 @@ ZedHub Connector
     |
     | outbound WSS/HTTPS
     v
-IoT Core Edge Session / Integration Access Service
+IoT Core Hub Session / Integration Access Service
 ```
 
 Home Assistant is the first profile. The cloud contract remains based on the
