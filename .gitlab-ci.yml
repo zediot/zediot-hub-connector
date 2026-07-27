@@ -1,0 +1,9 @@
+stages:
+  - validate
+
+bootstrap-validation:
+  stage: validate
+  image: python:3.11-slim
+  script:
+    - python -m compileall -q src
+    - PYTHONPATH=src python -m unittest discover -s tests -v
