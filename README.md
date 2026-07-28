@@ -17,14 +17,13 @@ Home Assistant installation to ZedIoT Core.
 
 ## Status
 
-This repository is a pre-implementation bootstrap. It freezes ownership,
-packaging, and release identifiers, but it is not yet an installable Home
-Assistant app.
+HUB-02 implementation candidate. The repository now contains a Home Assistant
+App manifest, Supervisor WebSocket snapshot/event client, key-bound Core
+session client, bounded SQLite store-and-forward queue, low-frequency
+reconciliation, runtime heartbeat/lease and bounded retry/circuit breaker.
 
-The Home Assistant `config.yaml`, runtime image, pairing flow, and session
-implementation will be added through the IoT Core `R6-S4-B1m` and
-`R6-S4-B1n` stories. Until those contracts are implemented and validated,
-the `zediot_hub_connector/` directory intentionally contains no app manifest.
+Local focused tests are required before publishing an installable image. Live
+Home Assistant and IoT Core approval/session smoke remains a separate gate.
 
 ## Responsibilities
 
@@ -54,4 +53,17 @@ repository boundary.
   same Python runtime.
 - Architectures: `amd64` and `aarch64`.
 
-Pre-built images are not published from this bootstrap commit.
+Pre-built images are not published until Core contract, multi-architecture
+build, revoke and live fault-smoke gates pass.
+
+## Runtime contract
+
+- HA access uses `homeassistant_api: true` and the local `SUPERVISOR_TOKEN`.
+- The token is never sent to Core or written to the queue.
+- Pairing input is a self-contained one-time code returned by IoT Core.
+- Incremental `state_changed` events use a durable monotonic sequence.
+- The queue is bounded by both 24 hours and 100 MiB; dropped rows are counted.
+- Full reconciliation defaults to every 6 hours and can be configured only
+  within 6–24 hours.
+- Core retries are bounded and protected by a closed/open/half-open circuit
+  breaker.
