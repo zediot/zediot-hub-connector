@@ -17,13 +17,16 @@ Home Assistant installation to ZedIoT Core.
 
 ## Status
 
-HUB-02 implementation candidate. The repository now contains a Home Assistant
-App manifest, Supervisor WebSocket snapshot/event client, key-bound Core
-session client, bounded SQLite store-and-forward queue, low-frequency
-reconciliation, runtime heartbeat/lease and bounded retry/circuit breaker.
+The repository contains one shared runtime with two distribution profiles:
 
-Local focused tests are required before publishing an installable image. Live
-Home Assistant and IoT Core approval/session smoke remains a separate gate.
+- Home Assistant OS/Supervised app using the local Supervisor API;
+- Home Assistant Container/managed Linux companion container using a
+  read-only long-lived-token file.
+
+Pairing, session, bounded replay, command receipt and local rule focused tests
+are required before publishing a versioned multi-architecture image. Internal
+Home Assistant Container enrollment/session/uplink smoke has passed; anonymous
+repository and registry access remains the public-release gate.
 
 ## Responsibilities
 
@@ -46,19 +49,23 @@ The connector does not own:
 See [docs/architecture-boundary.md](docs/architecture-boundary.md) for the
 repository boundary.
 
-## Planned distribution
+## Distribution
 
-- Home Assistant OS: third-party Home Assistant app repository.
+- Home Assistant OS/Supervised: third-party Home Assistant app repository.
 - Home Assistant Container or managed Linux: standalone Docker image using the
   same Python runtime.
 - Architectures: `amd64` and `aarch64`.
 
-Pre-built images are not published until Core contract, multi-architecture
-build, revoke and live fault-smoke gates pass.
+The Home Assistant app consumes versioned images from the project registry.
+The registry and repository must be anonymously readable before giving the
+repository URL to ordinary users.
 
 ## Runtime contract
 
-- HA access uses `homeassistant_api: true` and the local `SUPERVISOR_TOKEN`.
+- HA OS/Supervised access uses `homeassistant_api: true` and the local
+  `SUPERVISOR_TOKEN`.
+- HA Container access uses `ZEDIOT_HA_TOKEN_FILE`; the token must be mounted
+  read-only and must not be placed in an environment variable.
 - The token is never sent to Core or written to the queue.
 - Pairing input is a self-contained one-time code returned by IoT Core.
 - Incremental `state_changed` events use a durable monotonic sequence.

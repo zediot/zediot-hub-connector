@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import json
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
@@ -12,7 +14,10 @@ class ConnectorConfig:
     display_name: str
     installation_id: str
     pairing_code: str | None
-    supervisor_token: str
+    ha_websocket_url: str
+    ha_access_token: str
+    ha_auth_mode: str
+    runtime_kind: str
     state_dir: Path
     reconciliation_interval_seconds: int = 21600
     heartbeat_interval_seconds: int = 30
@@ -32,6 +37,31 @@ class ConnectorConfig:
     @classmethod
     def from_env(cls) -> "ConnectorConfig":
         options = _load_options()
+        state_dir = Path(os.getenv("ZEDIOT_STATE_DIR", "/data")).resolve()
+        state_dir.mkdir(parents=True, exist_ok=True)
+        ha_auth_mode = (
+            os.getenv("ZEDIOT_HA_AUTH_MODE")
+            or ("supervisor" if os.getenv("SUPERVISOR_TOKEN") else "token_file")
+        ).strip()
+        if ha_auth_mode not in {"supervisor", "token_file"}:
+            raise ValueError(
+                "ZEDIOT_HA_AUTH_MODE must be supervisor or token_file"
+            )
+        if ha_auth_mode == "supervisor":
+            ha_access_token = _required("SUPERVISOR_TOKEN")
+            default_websocket_url = "ws://supervisor/core/websocket"
+            default_runtime_kind = "home_assistant_addon"
+        else:
+            ha_access_token = _required_secret_file("ZEDIOT_HA_TOKEN_FILE")
+            default_websocket_url = (
+                "ws://host.docker.internal:8123/api/websocket"
+            )
+            default_runtime_kind = "home_assistant_container"
+        ha_websocket_url = (
+            os.getenv("ZEDIOT_HA_WEBSOCKET_URL")
+            or default_websocket_url
+        ).strip()
+        _validate_websocket_url(ha_websocket_url)
         reconciliation = _bounded_int(
             "ZEDIOT_RECONCILIATION_INTERVAL_SECONDS",
             default=21600,
@@ -53,21 +83,22 @@ class ConnectorConfig:
                 option_key="display_name",
                 default="ZedIoT Hub Connector",
             ),
-            installation_id=_value(
-                "ZEDIOT_INSTALLATION_ID",
+            installation_id=_installation_id(
+                state_dir=state_dir,
                 options=options,
-                option_key="installation_id",
-                required=True,
             ),
-            pairing_code=_value(
+            pairing_code=_secret_value(
                 "ZEDIOT_PAIRING_CODE",
+                file_env_name="ZEDIOT_PAIRING_CODE_FILE",
                 options=options,
                 option_key="pairing_code",
-                default="",
             )
             or None,
-            supervisor_token=_required("SUPERVISOR_TOKEN"),
-            state_dir=Path(os.getenv("ZEDIOT_STATE_DIR", "/data")).resolve(),
+            ha_websocket_url=ha_websocket_url,
+            ha_access_token=ha_access_token,
+            ha_auth_mode=ha_auth_mode,
+            runtime_kind=_runtime_kind(default_runtime_kind),
+            state_dir=state_dir,
             reconciliation_interval_seconds=reconciliation,
             heartbeat_interval_seconds=_bounded_int(
                 "ZEDIOT_HEARTBEAT_INTERVAL_SECONDS",
@@ -135,6 +166,63 @@ def _required(name: str) -> str:
     return value
 
 
+def _required_secret_file(name: str) -> str:
+    raw_path = os.getenv(name, "").strip()
+    if not raw_path:
+        raise ValueError(f"{name} is required")
+    path = Path(raw_path)
+    if not path.is_file():
+        raise ValueError(f"{name} must point to a readable file")
+    value = path.read_text(encoding="utf-8").strip()
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    return value
+
+
+def _secret_value(
+    name: str,
+    *,
+    file_env_name: str,
+    options: dict[str, object],
+    option_key: str,
+) -> str:
+    file_path = os.getenv(file_env_name, "").strip()
+    if file_path:
+        return _required_secret_file(file_env_name)
+    return str(os.getenv(name) or options.get(option_key) or "").strip()
+
+
+def _installation_id(
+    *,
+    state_dir: Path,
+    options: dict[str, object],
+) -> str:
+    configured = str(
+        os.getenv("ZEDIOT_INSTALLATION_ID")
+        or options.get("installation_id")
+        or ""
+    ).strip()
+    if configured:
+        return configured
+    path = state_dir / "installation_id"
+    if path.exists():
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    value = f"ha-{uuid.uuid4().hex}"
+    path.write_text(value, encoding="utf-8")
+    path.chmod(0o600)
+    return value
+
+
+def _validate_websocket_url(value: str) -> None:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"ws", "wss"} or not parsed.netloc:
+        raise ValueError(
+            "ZEDIOT_HA_WEBSOCKET_URL must be an absolute ws:// or wss:// URL"
+        )
+
+
 def _bounded_int(
     name: str,
     *,
@@ -186,3 +274,14 @@ def _csv_set(value: str) -> frozenset[str]:
             "ZEDIOT_RULE_PACKAGE_TRUSTED_KEY_IDS must not be empty"
         )
     return items
+
+
+def _runtime_kind(default: str) -> str:
+    value = (os.getenv("ZEDIOT_RUNTIME_KIND") or default).strip()
+    allowed = {"home_assistant_addon", "home_assistant_container"}
+    if value not in allowed:
+        raise ValueError(
+            "ZEDIOT_RUNTIME_KIND must be home_assistant_addon or "
+            "home_assistant_container"
+        )
+    return value

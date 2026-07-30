@@ -5,6 +5,7 @@ __pycache__
 .pytest_cache
 tests
 data
+deploy/docker/secrets
 *.pem
 *.key
 *.token

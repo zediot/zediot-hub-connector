@@ -39,6 +39,7 @@ class IoTCoreHubClient:
         installation_id: str,
         display_name: str,
         public_key_pem: str,
+        runtime_kind: str,
     ) -> dict[str, Any]:
         enrollment_id = pairing_code.split(".", 1)[0]
         return self._request(
@@ -52,7 +53,7 @@ class IoTCoreHubClient:
                 "public_key_pem": public_key_pem,
                 "contract_version": "1.0",
                 "manifest": {
-                    "runtime": "home_assistant_addon",
+                    "runtime": runtime_kind,
                     "contract_version": "1.0",
                 },
             },
@@ -342,7 +343,9 @@ class IoTCoreHubClient:
         return dict(body.get("data") or {})
 
 
-def _parse_time(value: str) -> datetime:
+def _parse_time(value: str | int | float) -> datetime:
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
         timezone.utc
     )

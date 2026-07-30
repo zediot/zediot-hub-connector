@@ -1,6 +1,6 @@
 import json
 
-from zediot_ha_hub_connector.ha_client import HomeAssistantSupervisorClient
+from zediot_ha_hub_connector.ha_client import HomeAssistantClient
 
 
 class FakeSocket:
@@ -35,11 +35,15 @@ class FakeSocket:
         return None
 
 
-def test_ha_event_subscription_uses_supervisor_websocket_without_exposing_token():
+def test_ha_event_subscription_uses_configured_websocket_without_exposing_token():
     socket = FakeSocket()
-    client = HomeAssistantSupervisorClient(
-        supervisor_token="must-not-leak",
-        create_connection=lambda *_args, **_kwargs: socket,
+    requested_urls = []
+    client = HomeAssistantClient(
+        access_token="must-not-leak",
+        websocket_url="ws://home-assistant.local:8123/api/websocket",
+        create_connection=lambda url, **_kwargs: (
+            requested_urls.append(url) or socket
+        ),
     )
     events = client.subscribe_state_events()
     event = next(events)
@@ -51,4 +55,7 @@ def test_ha_event_subscription_uses_supervisor_websocket_without_exposing_token(
         "type": "subscribe_events",
         "event_type": "state_changed",
     } in socket.sent
+    assert requested_urls == [
+        "ws://home-assistant.local:8123/api/websocket"
+    ]
     assert "must-not-leak" not in str(event)

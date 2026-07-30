@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from zediot_ha_hub_connector.command_store import CommandReceiptStore
-from zediot_ha_hub_connector.ha_client import HomeAssistantSupervisorClient
+from zediot_ha_hub_connector.ha_client import HomeAssistantClient
 
 TERMINAL_STATUSES = frozenset({"executed", "failed", "timeout"})
 
@@ -13,7 +13,7 @@ class HubCommandExecutor:
     def __init__(
         self,
         *,
-        home_assistant: HomeAssistantSupervisorClient,
+        home_assistant: HomeAssistantClient,
         receipts: CommandReceiptStore,
     ) -> None:
         self.home_assistant = home_assistant

@@ -1,8 +1,9 @@
 name: ZedIoT Hub Connector
-version: 0.1.0
+version: 0.2.0
 slug: zediot_hub_connector
 description: Secure outbound Home Assistant connection to ZedIoT Core
 url: https://gitlab.osvie.com/zed.sites/zediot-hub-connector
+image: registry.gitlab.osvie.com/zed.sites/zediot-hub-connector/{arch}
 startup: services
 boot: auto
 init: false
@@ -14,7 +15,6 @@ options:
   core_url: ""
   pairing_code: ""
   display_name: ZedIoT Hub Connector
-  installation_id: ""
   reconciliation_interval_seconds: 21600
   heartbeat_interval_seconds: 30
   queue_max_age_seconds: 86400
@@ -27,7 +27,6 @@ schema:
   core_url: url
   pairing_code: password
   display_name: str
-  installation_id: str
   reconciliation_interval_seconds: int(21600,86400)
   heartbeat_interval_seconds: int(15,60)
   queue_max_age_seconds: int(3600,86400)

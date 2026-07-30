@@ -4,7 +4,7 @@ import hashlib
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
-from zediot_ha_hub_connector.ha_client import HomeAssistantSupervisorClient
+from zediot_ha_hub_connector.ha_client import HomeAssistantClient
 from zediot_ha_hub_connector.rule_package import (
     VerifiedRulePackage,
     parse_time,
@@ -27,7 +27,7 @@ class HomeAssistantLocalRuleRuntime:
         self,
         *,
         store: LocalRuleStore,
-        home_assistant: HomeAssistantSupervisorClient,
+        home_assistant: HomeAssistantClient,
         integration_instance_id: str,
         trusted_key_ids: frozenset[str],
     ) -> None:

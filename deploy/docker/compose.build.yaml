@@ -1,0 +1,5 @@
+services:
+  zediot-hub-connector:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile

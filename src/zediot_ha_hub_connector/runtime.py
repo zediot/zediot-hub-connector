@@ -11,7 +11,7 @@ from zediot_ha_hub_connector.config import ConnectorConfig
 from zediot_ha_hub_connector.command_executor import HubCommandExecutor
 from zediot_ha_hub_connector.command_store import CommandReceiptStore
 from zediot_ha_hub_connector.core_client import HubSession, IoTCoreHubClient
-from zediot_ha_hub_connector.ha_client import HomeAssistantSupervisorClient
+from zediot_ha_hub_connector.ha_client import HomeAssistantClient
 from zediot_ha_hub_connector.identity import (
     ConnectorIdentity,
     ConnectorIdentityStore,
@@ -34,13 +34,14 @@ class HubConnectorRuntime:
         config: ConnectorConfig,
         *,
         core: IoTCoreHubClient | None = None,
-        home_assistant: HomeAssistantSupervisorClient | None = None,
+        home_assistant: HomeAssistantClient | None = None,
         sleep=time.sleep,
     ) -> None:
         self.config = config
         self.core = core or IoTCoreHubClient(base_url=config.core_url)
-        self.home_assistant = home_assistant or HomeAssistantSupervisorClient(
-            supervisor_token=config.supervisor_token
+        self.home_assistant = home_assistant or HomeAssistantClient(
+            access_token=config.ha_access_token,
+            websocket_url=config.ha_websocket_url,
         )
         self.identity_store = ConnectorIdentityStore(config.state_dir)
         self.queue = BoundedUplinkQueue(
@@ -83,6 +84,7 @@ class HubConnectorRuntime:
                 installation_id=self.config.installation_id,
                 display_name=self.config.display_name,
                 public_key_pem=self.identity_store.public_key_pem(identity),
+                runtime_kind=self.config.runtime_kind,
             )
             identity = self.identity_store.save_exchange(
                 enrollment_id=exchanged["enrollment_id"],

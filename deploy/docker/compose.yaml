@@ -1,0 +1,31 @@
+services:
+  zediot-hub-connector:
+    image: ${ZEDIOT_CONNECTOR_IMAGE:-registry.gitlab.osvie.com/zed.sites/zediot-hub-connector/amd64:0.2.0}
+    container_name: zediot-hub-connector
+    restart: unless-stopped
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      ZEDIOT_CORE_URL: ${ZEDIOT_CORE_URL}
+      ZEDIOT_CONNECTOR_DISPLAY_NAME: ${ZEDIOT_CONNECTOR_DISPLAY_NAME:-ZedIoT Hub Connector}
+      ZEDIOT_INSTALLATION_ID: ${ZEDIOT_INSTALLATION_ID:-}
+      ZEDIOT_HA_AUTH_MODE: token_file
+      ZEDIOT_HA_WEBSOCKET_URL: ${ZEDIOT_HA_WEBSOCKET_URL:-ws://host.docker.internal:8123/api/websocket}
+      ZEDIOT_HA_TOKEN_FILE: /run/secrets/ha_token
+      ZEDIOT_PAIRING_CODE_FILE: /run/secrets/pairing_code
+      ZEDIOT_RUNTIME_KIND: home_assistant_container
+      ZEDIOT_STATE_DIR: /data
+    secrets:
+      - ha_token
+      - pairing_code
+    volumes:
+      - connector_state:/data
+
+secrets:
+  ha_token:
+    file: ./secrets/ha_token
+  pairing_code:
+    file: ./secrets/pairing_code
+
+volumes:
+  connector_state:

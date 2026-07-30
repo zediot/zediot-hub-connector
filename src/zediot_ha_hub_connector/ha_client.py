@@ -17,14 +17,16 @@ class HomeAssistantSnapshot:
     observed_at: datetime
 
 
-class HomeAssistantSupervisorClient:
+class HomeAssistantClient:
     def __init__(
         self,
         *,
-        supervisor_token: str,
+        access_token: str,
+        websocket_url: str,
         create_connection: Callable[..., Any] = websocket.create_connection,
     ) -> None:
-        self._token = supervisor_token
+        self._token = access_token
+        self._websocket_url = websocket_url
         self._create_connection = create_connection
 
     def collect_snapshot(self) -> HomeAssistantSnapshot:
@@ -100,7 +102,7 @@ class HomeAssistantSupervisorClient:
 
     def _open(self) -> Any:
         socket = self._create_connection(
-            "ws://supervisor/core/websocket",
+            self._websocket_url,
             timeout=30,
         )
         required = self._receive_non_ping(socket)
@@ -134,3 +136,7 @@ class HomeAssistantSupervisorClient:
                 socket.send(json.dumps({"id": message.get("id"), "type": "pong"}))
                 continue
             return message
+
+
+# Compatibility alias for existing integrations importing the original class.
+HomeAssistantSupervisorClient = HomeAssistantClient
