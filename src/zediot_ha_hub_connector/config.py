@@ -22,6 +22,12 @@ class ConnectorConfig:
     retry_base_seconds: float = 1.0
     circuit_failure_threshold: int = 5
     circuit_recovery_seconds: int = 60
+    trusted_rule_package_key_ids: frozenset[str] = frozenset(
+        {"rule-package-signing-v1"}
+    )
+    rule_poll_interval_seconds: int = 5
+    rule_evidence_max_rows: int = 5000
+    rule_evidence_retention_seconds: int = 7 * 24 * 60 * 60
 
     @classmethod
     def from_env(cls) -> "ConnectorConfig":
@@ -87,6 +93,38 @@ class ConnectorConfig:
                 options=options,
                 option_key="queue_max_bytes",
             ),
+            trusted_rule_package_key_ids=_csv_set(
+                _value(
+                    "ZEDIOT_RULE_PACKAGE_TRUSTED_KEY_IDS",
+                    options=options,
+                    option_key="rule_package_trusted_key_ids",
+                    default="rule-package-signing-v1",
+                )
+            ),
+            rule_poll_interval_seconds=_bounded_int(
+                "ZEDIOT_RULE_POLL_INTERVAL_SECONDS",
+                default=5,
+                minimum=1,
+                maximum=60,
+                options=options,
+                option_key="rule_poll_interval_seconds",
+            ),
+            rule_evidence_max_rows=_bounded_int(
+                "ZEDIOT_RULE_EVIDENCE_MAX_ROWS",
+                default=5000,
+                minimum=100,
+                maximum=50000,
+                options=options,
+                option_key="rule_evidence_max_rows",
+            ),
+            rule_evidence_retention_seconds=_bounded_int(
+                "ZEDIOT_RULE_EVIDENCE_RETENTION_SECONDS",
+                default=7 * 24 * 60 * 60,
+                minimum=86400,
+                maximum=7 * 24 * 60 * 60,
+                options=options,
+                option_key="rule_evidence_retention_seconds",
+            ),
         )
 
 
@@ -135,3 +173,16 @@ def _load_options() -> dict[str, object]:
         return {}
     payload = json.loads(path.read_text(encoding="utf-8"))
     return payload if isinstance(payload, dict) else {}
+
+
+def _csv_set(value: str) -> frozenset[str]:
+    items = frozenset(
+        item.strip()
+        for item in value.split(",")
+        if item.strip()
+    )
+    if not items:
+        raise ValueError(
+            "ZEDIOT_RULE_PACKAGE_TRUSTED_KEY_IDS must not be empty"
+        )
+    return items

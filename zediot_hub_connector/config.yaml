@@ -19,6 +19,10 @@ options:
   heartbeat_interval_seconds: 30
   queue_max_age_seconds: 86400
   queue_max_bytes: 104857600
+  rule_package_trusted_key_ids: rule-package-signing-v1
+  rule_poll_interval_seconds: 5
+  rule_evidence_max_rows: 5000
+  rule_evidence_retention_seconds: 604800
 schema:
   core_url: url
   pairing_code: password
@@ -28,3 +32,7 @@ schema:
   heartbeat_interval_seconds: int(15,60)
   queue_max_age_seconds: int(3600,86400)
   queue_max_bytes: int(1048576,104857600)
+  rule_package_trusted_key_ids: str
+  rule_poll_interval_seconds: int(1,60)
+  rule_evidence_max_rows: int(100,50000)
+  rule_evidence_retention_seconds: int(86400,604800)

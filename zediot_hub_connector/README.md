@@ -1,8 +1,10 @@
 # ZedIoT Hub Connector App
 
-This directory is reserved for the Home Assistant app with slug
-`zediot_hub_connector`.
+The Home Assistant app runs the same `zediot_ha_hub_connector` runtime as the
+standalone image. It maintains only bounded delivery queues, command receipts,
+verified active local-rule packages and short-retention execution evidence.
 
-The app manifest and image are intentionally absent from the bootstrap. They
-will be added only after the pairing and hub-session contracts are implemented
-and validated.
+Local rules are fail-closed: only signed packages from a configured trusted key
+id, the current integration instance, the supported runtime version and the
+reviewed `light.power` action profile can execute. Raw Home Assistant payloads,
+tokens and credentials are never persisted in rule evidence.

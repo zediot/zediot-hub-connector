@@ -55,6 +55,7 @@ def _runtime(tmp_path: Path, core, home_assistant) -> HubConnectorRuntime:
     )
     runtime.session = HubSession(
         session_id="hsess_1",
+        integration_instance_id="int_test",
         lease_generation=1,
         lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=90),
         resume_cursor=None,

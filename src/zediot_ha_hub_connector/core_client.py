@@ -13,6 +13,7 @@ from zediot_ha_hub_connector.identity import ConnectorIdentity
 @dataclass(frozen=True)
 class HubSession:
     session_id: str
+    integration_instance_id: str
     lease_generation: int
     lease_expires_at: datetime
     resume_cursor: dict[str, Any] | None
@@ -122,6 +123,7 @@ class IoTCoreHubClient:
         )
         return HubSession(
             session_id=row["session_id"],
+            integration_instance_id=row["integration_instance_id"],
             lease_generation=int(row["lease_generation"]),
             lease_expires_at=_parse_time(row["lease_expires_at"]),
             resume_cursor=(
@@ -233,6 +235,76 @@ class IoTCoreHubClient:
                 "status": status,
                 "reason_code": reason_code,
                 "evidence": evidence,
+            },
+        )
+
+    def claim_rule_packages(
+        self,
+        *,
+        identity: ConnectorIdentity,
+        session: HubSession,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        self._ensure_token(identity)
+        return self._request(
+            "POST",
+            (
+                f"/api/hub/v1/sessions/{session.session_id}/"
+                "rule-packages/claim"
+            ),
+            json={
+                "lease_generation": session.lease_generation,
+                "limit": limit,
+            },
+        )
+
+    def acknowledge_rule_package(
+        self,
+        *,
+        identity: ConnectorIdentity,
+        session: HubSession,
+        package_id: str,
+        receipt_id: str,
+        package_hash: str,
+        status: str,
+        reason_code: str | None,
+        evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._ensure_token(identity)
+        return self._request(
+            "POST",
+            (
+                f"/api/hub/v1/sessions/{session.session_id}/"
+                f"rule-packages/{package_id}/receipt"
+            ),
+            json={
+                "lease_generation": session.lease_generation,
+                "receipt_id": receipt_id,
+                "package_hash": package_hash,
+                "status": status,
+                "reason_code": reason_code,
+                "evidence": evidence,
+                "reported_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    def upload_rule_evidence(
+        self,
+        *,
+        identity: ConnectorIdentity,
+        session: HubSession,
+        items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        self._ensure_token(identity)
+        return self._request(
+            "POST",
+            (
+                f"/api/hub/v1/sessions/{session.session_id}/"
+                "rule-executions/evidence"
+            ),
+            json={
+                "lease_generation": session.lease_generation,
+                "items": items,
             },
         )
 

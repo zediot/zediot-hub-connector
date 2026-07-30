@@ -52,6 +52,7 @@ def test_runtime_flushes_contiguous_events_and_removes_acknowledged_rows(
     )
     runtime.session = HubSession(
         session_id="hsess_1",
+        integration_instance_id="int_test",
         lease_generation=1,
         lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=90),
         resume_cursor=None,
