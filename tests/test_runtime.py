@@ -1,6 +1,8 @@
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from zediot_ha_hub_connector.config import ConnectorConfig
@@ -11,8 +13,26 @@ from zediot_ha_hub_connector.runtime import HubConnectorRuntime
 
 
 class FakeCore:
-    def __init__(self):
+    def __init__(self, *, resume_cursor=None):
         self.events = []
+        self.resume_cursor = resume_cursor
+
+    def enrollment_status(self, *, enrollment_id, exchange_receipt):
+        return {"status": "approved"}
+
+    def authenticate(self, identity):
+        return None
+
+    def connect_session(self, *, identity, resume_cursor):
+        return HubSession(
+            session_id="hsess_prepare",
+            integration_instance_id="int_test",
+            lease_generation=1,
+            lease_expires_at=(
+                datetime.now(timezone.utc) + timedelta(seconds=90)
+            ),
+            resume_cursor=self.resume_cursor,
+        )
 
     def upload_events(self, *, identity, session, payload):
         self.events.append(payload)
@@ -147,3 +167,68 @@ def test_runtime_queues_reconciliation_after_capacity_drop(tmp_path: Path):
     assert len(queued) == 1
     assert queued[0].kind == "snapshot"
     assert queued[0].payload["run_type"] == "reconciliation"
+
+
+def test_unenrolled_runtime_requires_pairing_code(tmp_path: Path):
+    config = ConnectorConfig(
+        core_url="https://core.example",
+        display_name="Test",
+        installation_id="install-1",
+        pairing_code=None,
+        ha_websocket_url="ws://supervisor/core/websocket",
+        ha_access_token="supervisor",
+        ha_auth_mode="supervisor",
+        runtime_kind="home_assistant_addon",
+        state_dir=tmp_path,
+        retry_base_seconds=0,
+    )
+    runtime = HubConnectorRuntime(
+        config,
+        core=FakeCore(),
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(RuntimeError, match="HUB_PAIRING_REQUIRED"):
+        runtime.prepare()
+
+
+def test_enrolled_runtime_restarts_without_pairing_and_repairs_queue_gap(
+    tmp_path: Path,
+):
+    config = ConnectorConfig(
+        core_url="https://core.example",
+        display_name="Test",
+        installation_id="install-1",
+        pairing_code=None,
+        ha_websocket_url="ws://supervisor/core/websocket",
+        ha_access_token="supervisor",
+        ha_auth_mode="supervisor",
+        runtime_kind="home_assistant_addon",
+        state_dir=tmp_path,
+        retry_base_seconds=0,
+    )
+    runtime = HubConnectorRuntime(
+        config,
+        core=FakeCore(resume_cursor={"uplink_sequence": 1}),
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    runtime.identity_store.load_or_create()
+    runtime.identity_store.save_exchange(
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    runtime.queue.enqueue(kind="event", payload={"value": "first"})
+    runtime.queue.enqueue(kind="event", payload={"value": "second"})
+    with sqlite3.connect(runtime.queue.path) as connection:
+        connection.execute("UPDATE uplink_queue SET sequence = sequence + 9")
+
+    runtime.prepare()
+
+    assert runtime.identity is not None
+    assert runtime.identity.connector_id == "hub_1"
+    assert runtime.queue.summary()["queue_depth"] == 0
+    assert runtime.queue.needs_reconciliation() is True

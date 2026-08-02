@@ -115,8 +115,7 @@ class HubConnectorRuntime:
         server_cursor = dict(self.session.resume_cursor or {})
         acknowledged = int(server_cursor.get("uplink_sequence") or 0)
         self.cursor = server_cursor or {"uplink_sequence": acknowledged}
-        self.queue.acknowledge_through(acknowledged)
-        self.queue.ensure_next_sequence_at_least(acknowledged + 1)
+        self.queue.synchronize_with_server_cursor(acknowledged)
 
     def enqueue_snapshot(self, *, run_type: str) -> QueueItem:
         snapshot = self.home_assistant.collect_snapshot()

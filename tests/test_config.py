@@ -58,6 +58,40 @@ def test_container_mode_reads_token_and_pairing_code_from_files(
     assert config.installation_id == "nas-ha"
 
 
+def test_consumed_pairing_code_file_is_optional_after_enrollment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    token_path = tmp_path / "ha_token"
+    token_path.write_text("ha-secret-token", encoding="utf-8")
+    pairing_path = tmp_path / "pairing_code"
+    pairing_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("ZEDIOT_CORE_URL", "https://core.example")
+    monkeypatch.setenv("ZEDIOT_HA_AUTH_MODE", "token_file")
+    monkeypatch.setenv("ZEDIOT_HA_TOKEN_FILE", str(token_path))
+    monkeypatch.setenv("ZEDIOT_PAIRING_CODE_FILE", str(pairing_path))
+    monkeypatch.setenv("ZEDIOT_STATE_DIR", str(tmp_path / "state"))
+
+    config = ConnectorConfig.from_env()
+
+    assert config.pairing_code is None
+
+
+def test_home_assistant_token_file_remains_required_and_nonempty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    token_path = tmp_path / "ha_token"
+    token_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("ZEDIOT_CORE_URL", "https://core.example")
+    monkeypatch.setenv("ZEDIOT_HA_AUTH_MODE", "token_file")
+    monkeypatch.setenv("ZEDIOT_HA_TOKEN_FILE", str(token_path))
+    monkeypatch.setenv("ZEDIOT_STATE_DIR", str(tmp_path / "state"))
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        ConnectorConfig.from_env()
+
+
 def test_invalid_home_assistant_websocket_url_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

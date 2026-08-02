@@ -87,7 +87,7 @@ class ConnectorConfig:
                 state_dir=state_dir,
                 options=options,
             ),
-            pairing_code=_secret_value(
+            pairing_code=_optional_secret_value(
                 "ZEDIOT_PAIRING_CODE",
                 file_env_name="ZEDIOT_PAIRING_CODE_FILE",
                 options=options,
@@ -179,7 +179,7 @@ def _required_secret_file(name: str) -> str:
     return value
 
 
-def _secret_value(
+def _optional_secret_value(
     name: str,
     *,
     file_env_name: str,
@@ -188,7 +188,10 @@ def _secret_value(
 ) -> str:
     file_path = os.getenv(file_env_name, "").strip()
     if file_path:
-        return _required_secret_file(file_env_name)
+        path = Path(file_path)
+        if not path.is_file():
+            return ""
+        return path.read_text(encoding="utf-8").strip()
     return str(os.getenv(name) or options.get(option_key) or "").strip()
 
 

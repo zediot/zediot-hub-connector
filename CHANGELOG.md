@@ -5,6 +5,10 @@
 - Preserve the acknowledged uplink sequence during queue capacity and age
   pressure, record dropped evidence, and schedule reconciliation instead of
   creating an unrecoverable Core cursor gap.
+- Allow an enrolled Connector to restart after its one-time pairing-code file
+  has been consumed, while keeping the Home Assistant token fail-closed.
+- Repair persisted queue tails that conflict with the authoritative Core cursor
+  during startup and schedule a full reconciliation snapshot.
 
 ## 0.2.0
 

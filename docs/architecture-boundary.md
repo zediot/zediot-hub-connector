@@ -26,7 +26,8 @@ read-only secret file. Neither token may leave the local network.
 
 Cloud identity is established through scoped pairing, a local asymmetric key
 pair, fingerprint approval, proof of possession, and a short-lived key-bound
-session token.
+session token. The one-time pairing code is a bootstrap input, not a permanent
+runtime dependency; the persisted key-bound identity owns restart continuity.
 
 ## Ownership boundary
 
@@ -42,8 +43,10 @@ Queue retention must never create a gap in the Core-owned uplink cursor. When
 the byte limit is reached, the Connector preserves the already queued
 contiguous prefix and rejects the new item. When the age limit invalidates the
 prefix, it clears the remaining unacknowledged tail and restarts from the last
-Core ACK cursor. Both cases emit dropped-count evidence and require a full
-reconciliation snapshot before the runtime returns to steady state.
+Core ACK cursor. Startup also compares the persisted tail with the
+authoritative Core cursor and clears a tail that does not start at the next
+expected sequence. All three cases emit dropped-count evidence and require a
+full reconciliation snapshot before the runtime returns to steady state.
 | Long-term telemetry and audit | IoT Core |
 | Tuya private protocol behavior | GHE Proxy/Adapter |
 

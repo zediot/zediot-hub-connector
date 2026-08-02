@@ -39,6 +39,11 @@ file and recreate it only for a new enrollment:
 truncate -s 0 secrets/pairing_code
 ```
 
+An enrolled Connector loads its persisted identity before deciding whether a
+pairing code is required, so restarts with this file empty are supported. If
+the state volume is new or has been cleared, startup fails with
+`HUB_PAIRING_REQUIRED` until a fresh one-time code is provided.
+
 The Home Assistant credential is mounted from a read-only secret file. It must
 not be placed in a Compose environment variable, committed to Git, written to
 logs, or uploaded to IoT Core. Connector identity, bounded queues and receipts

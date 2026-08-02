@@ -162,6 +162,49 @@ class BoundedUplinkQueue:
             if next_sequence <= sequence:
                 self._set_metadata(connection, "next_sequence", sequence + 1)
 
+    def synchronize_with_server_cursor(self, sequence: int) -> bool:
+        if sequence < 0:
+            raise ValueError("server cursor must not be negative")
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM uplink_queue WHERE sequence <= ?",
+                (sequence,),
+            )
+            self._set_metadata(
+                connection,
+                "acknowledged_sequence",
+                sequence,
+            )
+            row = connection.execute(
+                """
+                SELECT COUNT(*), COALESCE(MIN(sequence), 0),
+                       COALESCE(MAX(sequence), 0)
+                FROM uplink_queue
+                """
+            ).fetchone()
+            queued = int(row[0])
+            oldest = int(row[1])
+            latest = int(row[2])
+            expected = sequence + 1
+            contiguous = (
+                not queued
+                or (
+                    oldest == expected
+                    and queued == latest - oldest + 1
+                )
+            )
+            if not contiguous:
+                connection.execute("DELETE FROM uplink_queue")
+                self._set_metadata(connection, "next_sequence", expected)
+                self._record_drop(connection, count=queued)
+                return True
+            self._set_metadata(
+                connection,
+                "next_sequence",
+                latest + 1 if queued else expected,
+            )
+            return False
+
     def ensure_next_sequence_at_least(self, sequence: int) -> None:
         with self._connect() as connection:
             current = self._metadata_int(connection, "next_sequence", 1)
