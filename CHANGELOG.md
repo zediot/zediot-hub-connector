@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve the acknowledged uplink sequence during queue capacity and age
+  pressure, record dropped evidence, and schedule reconciliation instead of
+  creating an unrecoverable Core cursor gap.
+
 ## 0.2.0
 
 - Support one runtime in two installation profiles: Home Assistant OS/Supervised

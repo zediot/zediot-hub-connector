@@ -5,6 +5,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from zediot_ha_hub_connector.config import ConnectorConfig
 from zediot_ha_hub_connector.core_client import HubSession
+from zediot_ha_hub_connector.ha_client import HomeAssistantSnapshot
 from zediot_ha_hub_connector.identity import ConnectorIdentity
 from zediot_ha_hub_connector.runtime import HubConnectorRuntime
 
@@ -19,7 +20,14 @@ class FakeCore:
 
 
 class FakeHomeAssistant:
-    pass
+    def collect_snapshot(self):
+        return HomeAssistantSnapshot(
+            observed_at=datetime.now(timezone.utc),
+            areas=[],
+            devices=[],
+            entities=[],
+            states=[],
+        )
 
 
 def test_runtime_flushes_contiguous_events_and_removes_acknowledged_rows(
@@ -91,3 +99,51 @@ def test_runtime_flushes_contiguous_events_and_removes_acknowledged_rows(
     assert core.events[0]["sequence_start"] == 1
     assert core.events[0]["sequence_end"] == 2
     assert runtime.queue.summary()["queue_depth"] == 0
+
+
+def test_runtime_queues_reconciliation_after_capacity_drop(tmp_path: Path):
+    config = ConnectorConfig(
+        core_url="https://core.example",
+        display_name="Test",
+        installation_id="install-1",
+        pairing_code=None,
+        ha_websocket_url="ws://supervisor/core/websocket",
+        ha_access_token="supervisor",
+        ha_auth_mode="supervisor",
+        runtime_kind="home_assistant_addon",
+        state_dir=tmp_path,
+        queue_max_bytes=100,
+        queue_max_age_seconds=3600,
+        retry_base_seconds=0,
+    )
+    runtime = HubConnectorRuntime(
+        config,
+        core=FakeCore(),
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+
+    dropped = runtime.enqueue_event(
+        {
+            "time_fired": "2026-07-29T01:00:00Z",
+            "context": {"id": "ctx-overflow"},
+            "data": {
+                "new_state": {
+                    "entity_id": "sensor.large",
+                    "state": "x" * 500,
+                    "last_updated": "2026-07-29T01:00:00Z",
+                }
+            },
+        }
+    )
+
+    assert dropped.accepted is False
+    assert runtime.queue.needs_reconciliation() is True
+
+    runtime.queue.max_bytes = 1024 * 1024
+    assert runtime.enqueue_reconciliation_if_needed() is True
+    assert runtime.queue.needs_reconciliation() is False
+    queued = runtime.queue.peek_all(limit=10)
+    assert len(queued) == 1
+    assert queued[0].kind == "snapshot"
+    assert queued[0].payload["run_type"] == "reconciliation"

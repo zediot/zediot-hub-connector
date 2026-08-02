@@ -37,6 +37,13 @@ session token.
 | Tenant, Integration Instance, grants | IoT Core |
 | Mapping and Core asset identity | IoT Core |
 | Final presence/latest/command state | IoT Core |
+
+Queue retention must never create a gap in the Core-owned uplink cursor. When
+the byte limit is reached, the Connector preserves the already queued
+contiguous prefix and rejects the new item. When the age limit invalidates the
+prefix, it clears the remaining unacknowledged tail and restarts from the last
+Core ACK cursor. Both cases emit dropped-count evidence and require a full
+reconciliation snapshot before the runtime returns to steady state.
 | Long-term telemetry and audit | IoT Core |
 | Tuya private protocol behavior | GHE Proxy/Adapter |
 

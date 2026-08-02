@@ -15,6 +15,8 @@ class QueueItem:
     payload: dict[str, Any]
     created_at: datetime
     byte_size: int
+    accepted: bool = True
+    drop_reason: str | None = None
 
 
 class BoundedUplinkQueue:
@@ -39,8 +41,26 @@ class BoundedUplinkQueue:
             separators=(",", ":"),
         )
         created_at = datetime.now(timezone.utc)
+        byte_size = len(encoded.encode("utf-8"))
         with self._connect() as connection:
+            self._expire_stale_queue(connection, now=created_at)
             sequence = self._metadata_int(connection, "next_sequence", 1)
+            total = int(
+                connection.execute(
+                    "SELECT COALESCE(SUM(byte_size), 0) FROM uplink_queue"
+                ).fetchone()[0]
+            )
+            if byte_size > self.max_bytes or total + byte_size > self.max_bytes:
+                self._record_drop(connection, count=1)
+                return QueueItem(
+                    sequence=sequence,
+                    kind=kind,
+                    payload=dict(payload),
+                    created_at=created_at,
+                    byte_size=byte_size,
+                    accepted=False,
+                    drop_reason="queue_capacity_exceeded",
+                )
             self._set_metadata(connection, "next_sequence", sequence + 1)
             connection.execute(
                 """
@@ -52,22 +72,24 @@ class BoundedUplinkQueue:
                     sequence,
                     kind,
                     encoded,
-                    len(encoded.encode("utf-8")),
+                    byte_size,
                     created_at.isoformat(),
                 ),
             )
-            self._prune(connection, now=created_at)
         return QueueItem(
             sequence=sequence,
             kind=kind,
             payload=dict(payload),
             created_at=created_at,
-            byte_size=len(encoded.encode("utf-8")),
+            byte_size=byte_size,
         )
 
     def peek(self, *, kind: str, limit: int) -> list[QueueItem]:
         with self._connect() as connection:
-            self._prune(connection, now=datetime.now(timezone.utc))
+            self._expire_stale_queue(
+                connection,
+                now=datetime.now(timezone.utc),
+            )
             rows = connection.execute(
                 """
                 SELECT sequence, kind, payload_json, byte_size, created_at
@@ -91,7 +113,10 @@ class BoundedUplinkQueue:
 
     def peek_all(self, *, limit: int) -> list[QueueItem]:
         with self._connect() as connection:
-            self._prune(connection, now=datetime.now(timezone.utc))
+            self._expire_stale_queue(
+                connection,
+                now=datetime.now(timezone.utc),
+            )
             rows = connection.execute(
                 """
                 SELECT sequence, kind, payload_json, byte_size, created_at
@@ -118,6 +143,24 @@ class BoundedUplinkQueue:
                 "DELETE FROM uplink_queue WHERE sequence <= ?",
                 (sequence,),
             )
+            acknowledged = self._metadata_int(
+                connection,
+                "acknowledged_sequence",
+                0,
+            )
+            if sequence > acknowledged:
+                self._set_metadata(
+                    connection,
+                    "acknowledged_sequence",
+                    sequence,
+                )
+            next_sequence = self._metadata_int(
+                connection,
+                "next_sequence",
+                1,
+            )
+            if next_sequence <= sequence:
+                self._set_metadata(connection, "next_sequence", sequence + 1)
 
     def ensure_next_sequence_at_least(self, sequence: int) -> None:
         with self._connect() as connection:
@@ -127,6 +170,10 @@ class BoundedUplinkQueue:
 
     def summary(self) -> dict[str, int]:
         with self._connect() as connection:
+            self._expire_stale_queue(
+                connection,
+                now=datetime.now(timezone.utc),
+            )
             row = connection.execute(
                 """
                 SELECT COUNT(*), COALESCE(SUM(byte_size), 0),
@@ -140,7 +187,20 @@ class BoundedUplinkQueue:
             "oldest_sequence": int(row[2]),
             "latest_sequence": int(row[3]),
             "dropped_count": self._read_metadata_int("dropped_count", 0),
+            "reconciliation_required": self._read_metadata_int(
+                "reconciliation_required",
+                0,
+            ),
         }
+
+    def needs_reconciliation(self) -> bool:
+        return bool(
+            self._read_metadata_int("reconciliation_required", 0)
+        )
+
+    def mark_reconciliation_queued(self) -> None:
+        with self._connect() as connection:
+            self._set_metadata(connection, "reconciliation_required", 0)
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -169,34 +229,55 @@ class BoundedUplinkQueue:
             connection.execute(
                 "INSERT OR IGNORE INTO queue_metadata(key, value) VALUES ('dropped_count', 0)"
             )
-
-    def _prune(self, connection: sqlite3.Connection, *, now: datetime) -> None:
-        cutoff = now - timedelta(seconds=self.max_age_seconds)
-        expired = connection.execute(
-            "DELETE FROM uplink_queue WHERE created_at < ?",
-            (cutoff.isoformat(),),
-        ).rowcount
-        dropped = max(int(expired or 0), 0)
-        total = int(
             connection.execute(
-                "SELECT COALESCE(SUM(byte_size), 0) FROM uplink_queue"
+                "INSERT OR IGNORE INTO queue_metadata(key, value) VALUES ('acknowledged_sequence', 0)"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO queue_metadata(key, value) VALUES ('reconciliation_required', 0)"
+            )
+
+    def _expire_stale_queue(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        now: datetime,
+    ) -> None:
+        cutoff = now - timedelta(seconds=self.max_age_seconds)
+        expired = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM uplink_queue WHERE created_at < ?",
+                (cutoff.isoformat(),),
             ).fetchone()[0]
         )
-        while total > self.max_bytes:
-            oldest = connection.execute(
-                "SELECT sequence, byte_size FROM uplink_queue ORDER BY sequence LIMIT 1"
-            ).fetchone()
-            if oldest is None:
-                break
-            connection.execute(
-                "DELETE FROM uplink_queue WHERE sequence = ?",
-                (oldest[0],),
-            )
-            total -= int(oldest[1])
-            dropped += 1
-        if dropped:
-            current = self._metadata_int(connection, "dropped_count", 0)
-            self._set_metadata(connection, "dropped_count", current + dropped)
+        if not expired:
+            return
+        queued = int(
+            connection.execute("SELECT COUNT(*) FROM uplink_queue").fetchone()[0]
+        )
+        connection.execute("DELETE FROM uplink_queue")
+        acknowledged = self._metadata_int(
+            connection,
+            "acknowledged_sequence",
+            0,
+        )
+        self._set_metadata(
+            connection,
+            "next_sequence",
+            acknowledged + 1,
+        )
+        self._record_drop(connection, count=queued)
+
+    def _record_drop(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        count: int,
+    ) -> None:
+        if count <= 0:
+            return
+        current = self._metadata_int(connection, "dropped_count", 0)
+        self._set_metadata(connection, "dropped_count", current + count)
+        self._set_metadata(connection, "reconciliation_required", 1)
 
     def _read_metadata_int(self, key: str, default: int) -> int:
         with self._connect() as connection:

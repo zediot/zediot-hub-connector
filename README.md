@@ -69,7 +69,10 @@ repository URL to ordinary users.
 - The token is never sent to Core or written to the queue.
 - Pairing input is a self-contained one-time code returned by IoT Core.
 - Incremental `state_changed` events use a durable monotonic sequence.
-- The queue is bounded by both 24 hours and 100 MiB; dropped rows are counted.
+- The queue is bounded by both 24 hours and 100 MiB. Capacity overflow rejects
+  the new item without breaking the acknowledged sequence prefix; age expiry
+  clears the non-replayable tail back to the last Core ACK cursor. Both paths
+  increment dropped evidence and schedule a full reconciliation snapshot.
 - Full reconciliation defaults to every 6 hours and can be configured only
   within 6–24 hours.
 - Core retries are bounded and protected by a closed/open/half-open circuit

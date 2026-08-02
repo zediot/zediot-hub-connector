@@ -125,6 +125,17 @@ class HubConnectorRuntime:
             payload=build_snapshot_uplink(snapshot, run_type=run_type),
         )
 
+    def enqueue_reconciliation_if_needed(self, *, force: bool = False) -> bool:
+        required = self.queue.needs_reconciliation()
+        if not force and not required:
+            return False
+        item = self.enqueue_snapshot(run_type="reconciliation")
+        if not item.accepted:
+            return False
+        if required:
+            self.queue.mark_reconciliation_queued()
+        return True
+
     def enqueue_event(self, event: dict[str, Any]) -> QueueItem:
         data = dict(event.get("data") or {})
         new_state = data.get("new_state")
@@ -424,11 +435,17 @@ class HubConnectorRuntime:
             try:
                 self.heartbeat()
                 if (
-                    time.monotonic() - last_reconciliation
+                    self.queue.needs_reconciliation()
+                    or time.monotonic() - last_reconciliation
                     >= self.config.reconciliation_interval_seconds
                 ):
-                    self.enqueue_snapshot(run_type="reconciliation")
-                    last_reconciliation = time.monotonic()
+                    if self.enqueue_reconciliation_if_needed(
+                        force=(
+                            time.monotonic() - last_reconciliation
+                            >= self.config.reconciliation_interval_seconds
+                        )
+                    ):
+                        last_reconciliation = time.monotonic()
             except Exception:
                 self.breaker.failure()
 
