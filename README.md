@@ -9,7 +9,7 @@ Home Assistant installation to ZedIoT Core.
 |---|---|
 | Product | `ZedHub Connector` |
 | Home Assistant store name | `ZedIoT Hub Connector` |
-| Repository | `zediot-hub-connector` |
+| Public repository | `github.com/zediot/zediot-hub-connector` |
 | Home Assistant app slug | `zediot_hub_connector` |
 | Python package | `zediot_ha_hub_connector` |
 | Container service | `zediot-hub-connector` |
@@ -28,10 +28,10 @@ focused tests are required before publishing a versioned multi-architecture
 image. Internal Home Assistant Container enrollment/session/uplink smoke must
 pass together with anonymous repository and registry access.
 
-The release pipeline installs the package with its `test` extra and runs the
-pytest suite before any tagged image job. Distribution metadata tests keep the
-package, Add-on manifest, standalone Compose and environment example on the
-same version.
+The GitLab development pipeline and public GitHub pipeline both install the
+package with its `test` extra and run the pytest suite before any tagged image
+job. Distribution metadata tests keep the package, app manifest, standalone
+Compose and environment example on the same version.
 
 ## Responsibilities
 
@@ -56,14 +56,22 @@ repository boundary.
 
 ## Distribution
 
-- Home Assistant OS/Supervised: third-party Home Assistant app repository.
+- Home Assistant OS/Supervised: public third-party Home Assistant app
+  repository at `https://github.com/zediot/zediot-hub-connector`.
 - Home Assistant Container or managed Linux: standalone Docker image using the
   same Python runtime.
 - Architectures: `amd64` and `aarch64`.
 
-The Home Assistant app consumes versioned images from the project registry.
-The registry and repository must be anonymously readable before giving the
-repository URL to ordinary users.
+The Home Assistant app consumes versioned per-architecture images from GHCR:
+`ghcr.io/zediot/amd64-zediot-hub-connector` and
+`ghcr.io/zediot/aarch64-zediot-hub-connector`. The standalone profile consumes
+the multi-architecture `ghcr.io/zediot/zediot-hub-connector` image. All three
+packages and the GitHub repository must be anonymously readable before giving
+the repository URL to ordinary users.
+
+Private GitLab remains the development source of truth. Only reviewed release
+commits and tags are mirrored to GitHub; public GitHub changes must not create
+a second development truth source.
 
 ## Runtime contract
 

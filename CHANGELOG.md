@@ -4,6 +4,10 @@
 
 ## 0.2.1
 
+- Add the public GitHub App Repository and GHCR release workflow for anonymous
+  Home Assistant OS/Supervised and Container installation.
+- Keep private GitLab as the development source of truth while publishing only
+  reviewed commits and version tags to `github.com/zediot/zediot-hub-connector`.
 - Preserve the acknowledged uplink sequence during queue capacity and age
   pressure, record dropped evidence, and schedule reconciliation instead of
   creating an unrecoverable Core cursor gap.

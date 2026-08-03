@@ -12,7 +12,9 @@ is not a released Add-on repository.
 
 1. In IoT Core, open the target Home Assistant integration and create a
    one-time Hub Connector pairing code scoped to the target HOME.
-2. In Home Assistant, add the ZedIoT Apps repository to the Add-on Store.
+2. In Home Assistant, add
+   `https://github.com/zediot/zediot-hub-connector` to the App Store repository
+   list.
 3. Install **ZedIoT Hub Connector**.
 4. Set only `core_url`, the one-time `pairing_code`, and an optional
    `display_name`.

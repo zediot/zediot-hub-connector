@@ -2,8 +2,8 @@ name: ZedIoT Hub Connector
 version: 0.2.1
 slug: zediot_hub_connector
 description: Secure outbound Home Assistant connection to ZedIoT Core
-url: https://gitlab.osvie.com/zed.sites/zediot-hub-connector
-image: registry.gitlab.osvie.com/zed.sites/zediot-hub-connector/{arch}
+url: https://github.com/zediot/zediot-hub-connector
+image: ghcr.io/zediot/{arch}-zediot-hub-connector
 startup: services
 boot: auto
 init: false
