@@ -14,6 +14,11 @@ dependencies = [
   "websocket-client>=1.8,<2",
 ]
 
+[project.optional-dependencies]
+test = [
+  "pytest>=8,<9",
+]
+
 [project.scripts]
 zediot-hub-connector = "zediot_ha_hub_connector.main:main"
 

@@ -17,6 +17,10 @@
   to 50, so Core projection completes within the HTTP request budget.
 - Call Home Assistant services without requesting response data, allowing
   non-response actions such as light turn-on/turn-off to ACK successfully.
+- Keep package, Add-on, standalone Compose and environment-example versions on
+  `0.2.1`, and expose the bounded event batch size in the Container profile.
+- Replace the ineffective unittest release job with an installed pytest suite
+  that must pass before tagged multi-architecture image builds.
 
 ## 0.2.0
 

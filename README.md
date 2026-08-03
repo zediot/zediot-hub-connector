@@ -28,6 +28,11 @@ focused tests are required before publishing a versioned multi-architecture
 image. Internal Home Assistant Container enrollment/session/uplink smoke must
 pass together with anonymous repository and registry access.
 
+The release pipeline installs the package with its `test` extra and runs the
+pytest suite before any tagged image job. Distribution metadata tests keep the
+package, Add-on manifest, standalone Compose and environment example on the
+same version.
+
 ## Responsibilities
 
 The connector owns:

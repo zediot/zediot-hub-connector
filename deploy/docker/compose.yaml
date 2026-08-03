@@ -1,6 +1,6 @@
 services:
   zediot-hub-connector:
-    image: ${ZEDIOT_CONNECTOR_IMAGE:-registry.gitlab.osvie.com/zed.sites/zediot-hub-connector/amd64:0.2.0}
+    image: ${ZEDIOT_CONNECTOR_IMAGE:-registry.gitlab.osvie.com/zed.sites/zediot-hub-connector/amd64:0.2.1}
     container_name: zediot-hub-connector
     restart: unless-stopped
     extra_hosts:
@@ -15,6 +15,7 @@ services:
       ZEDIOT_PAIRING_CODE_FILE: /run/secrets/pairing_code
       ZEDIOT_RUNTIME_KIND: home_assistant_container
       ZEDIOT_STATE_DIR: /data
+      ZEDIOT_EVENT_BATCH_SIZE: ${ZEDIOT_EVENT_BATCH_SIZE:-50}
     secrets:
       - ha_token
       - pairing_code
