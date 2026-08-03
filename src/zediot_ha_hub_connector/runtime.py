@@ -10,7 +10,11 @@ from typing import Any
 from zediot_ha_hub_connector.config import ConnectorConfig
 from zediot_ha_hub_connector.command_executor import HubCommandExecutor
 from zediot_ha_hub_connector.command_store import CommandReceiptStore
-from zediot_ha_hub_connector.core_client import HubSession, IoTCoreHubClient
+from zediot_ha_hub_connector.core_client import (
+    HubSession,
+    HubSessionInvalidError,
+    IoTCoreHubClient,
+)
 from zediot_ha_hub_connector.ha_client import HomeAssistantClient
 from zediot_ha_hub_connector.identity import (
     ConnectorIdentity,
@@ -69,6 +73,7 @@ class HubConnectorRuntime:
         )
         self.sleep = sleep
         self.stop_event = threading.Event()
+        self._session_lock = threading.Lock()
         self.identity: ConnectorIdentity | None = None
         self.session: HubSession | None = None
         self.local_rule_runtime: HomeAssistantLocalRuleRuntime | None = None
@@ -100,8 +105,11 @@ class HubConnectorRuntime:
         )
         if status["status"] != "approved":
             raise RuntimeError(f"HUB_APPROVAL_{status['status'].upper()}")
-        self.core.authenticate(identity)
         self.identity = identity
+        self.core.authenticate(identity)
+        self._establish_session(identity)
+
+    def _establish_session(self, identity: ConnectorIdentity) -> None:
         self.session = self.core.connect_session(
             identity=identity,
             resume_cursor=self.cursor,
@@ -116,6 +124,26 @@ class HubConnectorRuntime:
         acknowledged = int(server_cursor.get("uplink_sequence") or 0)
         self.cursor = server_cursor or {"uplink_sequence": acknowledged}
         self.queue.synchronize_with_server_cursor(acknowledged)
+
+    def _recover_session(self, *, stale_session_id: str) -> None:
+        with self._session_lock:
+            if self.session and self.session.session_id != stale_session_id:
+                return
+            if self.identity is None:
+                raise RuntimeError("HUB_IDENTITY_NOT_READY")
+            self.core.authenticate(self.identity)
+            self._establish_session(self.identity)
+
+    def _recover_after_session_error(
+        self,
+        error: HubSessionInvalidError,
+    ) -> None:
+        try:
+            self._recover_session(stale_session_id=error.session_id)
+            self.breaker.success()
+        except Exception:
+            self.breaker.failure()
+            self.sleep(1)
 
     def enqueue_snapshot(self, *, run_type: str) -> QueueItem:
         snapshot = self.home_assistant.collect_snapshot()
@@ -172,7 +200,7 @@ class HubConnectorRuntime:
             return False
         if not self.identity or not self.session:
             raise RuntimeError("HUB_SESSION_NOT_READY")
-        items = self.queue.peek_all(limit=500)
+        items = self.queue.peek_all(limit=self.config.event_batch_size)
         if not items:
             return False
         first = items[0]
@@ -191,6 +219,7 @@ class HubConnectorRuntime:
                     max_attempts=self.config.retry_max_attempts,
                     base_seconds=self.config.retry_base_seconds,
                     sleep=self.sleep,
+                    retryable=_retryable_core_error,
                 )
                 acknowledged = int(receipt["cursor_after"])
             else:
@@ -223,6 +252,7 @@ class HubConnectorRuntime:
                     max_attempts=self.config.retry_max_attempts,
                     base_seconds=self.config.retry_base_seconds,
                     sleep=self.sleep,
+                    retryable=_retryable_core_error,
                 )
                 acknowledged = int(receipt["cursor_after"])
             self.queue.acknowledge_through(acknowledged)
@@ -256,6 +286,7 @@ class HubConnectorRuntime:
             max_attempts=self.config.retry_max_attempts,
             base_seconds=self.config.retry_base_seconds,
             sleep=self.sleep,
+            retryable=_retryable_core_error,
         )
         processed = 0
         for delivery in deliveries:
@@ -274,6 +305,7 @@ class HubConnectorRuntime:
                 max_attempts=self.config.retry_max_attempts,
                 base_seconds=self.config.retry_base_seconds,
                 sleep=self.sleep,
+                retryable=_retryable_core_error,
             )
             processed += 1
         return processed
@@ -290,6 +322,7 @@ class HubConnectorRuntime:
             max_attempts=self.config.retry_max_attempts,
             base_seconds=self.config.retry_base_seconds,
             sleep=self.sleep,
+            retryable=_retryable_core_error,
         )
         processed = 0
         for control in delivery.get("controls") or []:
@@ -342,6 +375,7 @@ class HubConnectorRuntime:
                 max_attempts=self.config.retry_max_attempts,
                 base_seconds=self.config.retry_base_seconds,
                 sleep=self.sleep,
+                retryable=_retryable_core_error,
             )
             processed += 1
         return processed
@@ -368,6 +402,7 @@ class HubConnectorRuntime:
             max_attempts=self.config.retry_max_attempts,
             base_seconds=self.config.retry_base_seconds,
             sleep=self.sleep,
+            retryable=_retryable_core_error,
         )
         accepted_ids = {
             str(item["execution_id"])
@@ -407,6 +442,8 @@ class HubConnectorRuntime:
             try:
                 if not self.flush_once():
                     self.sleep(0.5)
+            except HubSessionInvalidError as exc:
+                self._recover_after_session_error(exc)
             except Exception:
                 self.sleep(1)
 
@@ -415,6 +452,8 @@ class HubConnectorRuntime:
             try:
                 if not self.process_commands_once():
                     self.sleep(1)
+            except HubSessionInvalidError as exc:
+                self._recover_after_session_error(exc)
             except Exception:
                 self.sleep(1)
 
@@ -425,6 +464,8 @@ class HubConnectorRuntime:
                 uploaded = self.flush_rule_evidence_once()
                 if not processed and not uploaded:
                     self.sleep(self.config.rule_poll_interval_seconds)
+            except HubSessionInvalidError as exc:
+                self._recover_after_session_error(exc)
             except Exception:
                 self.sleep(self.config.rule_poll_interval_seconds)
 
@@ -445,6 +486,8 @@ class HubConnectorRuntime:
                         )
                     ):
                         last_reconciliation = time.monotonic()
+            except HubSessionInvalidError as exc:
+                self._recover_after_session_error(exc)
             except Exception:
                 self.breaker.failure()
 
@@ -481,3 +524,7 @@ def _source_event_id(
 def _stable_runtime_id(prefix: str, value: str) -> str:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
     return f"{prefix}_{digest}"
+
+
+def _retryable_core_error(error: Exception) -> bool:
+    return not isinstance(error, HubSessionInvalidError)

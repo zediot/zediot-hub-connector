@@ -6,7 +6,10 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from zediot_ha_hub_connector.config import ConnectorConfig
-from zediot_ha_hub_connector.core_client import HubSession
+from zediot_ha_hub_connector.core_client import (
+    HubSession,
+    HubSessionInvalidError,
+)
 from zediot_ha_hub_connector.ha_client import HomeAssistantSnapshot
 from zediot_ha_hub_connector.identity import ConnectorIdentity
 from zediot_ha_hub_connector.runtime import HubConnectorRuntime
@@ -37,6 +40,24 @@ class FakeCore:
     def upload_events(self, *, identity, session, payload):
         self.events.append(payload)
         return {"cursor_after": payload["sequence_end"]}
+
+
+class RecoveringFakeCore(FakeCore):
+    def __init__(self):
+        super().__init__()
+        self.connect_count = 0
+
+    def connect_session(self, *, identity, resume_cursor):
+        self.connect_count += 1
+        return HubSession(
+            session_id=f"hsess_recovered_{self.connect_count}",
+            integration_instance_id="int_test",
+            lease_generation=self.connect_count,
+            lease_expires_at=(
+                datetime.now(timezone.utc) + timedelta(seconds=90)
+            ),
+            resume_cursor=resume_cursor,
+        )
 
 
 class FakeHomeAssistant:
@@ -232,3 +253,105 @@ def test_enrolled_runtime_restarts_without_pairing_and_repairs_queue_gap(
     assert runtime.identity.connector_id == "hub_1"
     assert runtime.queue.summary()["queue_depth"] == 0
     assert runtime.queue.needs_reconciliation() is True
+
+
+def test_runtime_replaces_only_the_stale_session_once(tmp_path: Path):
+    config = ConnectorConfig(
+        core_url="https://core.example",
+        display_name="Test",
+        installation_id="install-1",
+        pairing_code=None,
+        ha_websocket_url="ws://supervisor/core/websocket",
+        ha_access_token="supervisor",
+        ha_auth_mode="supervisor",
+        runtime_kind="home_assistant_addon",
+        state_dir=tmp_path,
+        retry_base_seconds=0,
+    )
+    core = RecoveringFakeCore()
+    runtime = HubConnectorRuntime(
+        config,
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    runtime.identity = ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    runtime.session = HubSession(
+        session_id="hsess_stale",
+        integration_instance_id="int_test",
+        lease_generation=1,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=90),
+        resume_cursor=None,
+    )
+
+    error = HubSessionInvalidError(
+        session_id="hsess_stale",
+        detail="Hub session is not active",
+    )
+    runtime._recover_after_session_error(error)
+    runtime._recover_after_session_error(error)
+
+    assert runtime.session.session_id == "hsess_recovered_1"
+    assert core.connect_count == 1
+
+
+def test_runtime_limits_event_batches_to_request_budget(tmp_path: Path):
+    config = ConnectorConfig(
+        core_url="https://core.example",
+        display_name="Test",
+        installation_id="install-1",
+        pairing_code=None,
+        ha_websocket_url="ws://supervisor/core/websocket",
+        ha_access_token="supervisor",
+        ha_auth_mode="supervisor",
+        runtime_kind="home_assistant_addon",
+        state_dir=tmp_path,
+        event_batch_size=2,
+        retry_base_seconds=0,
+    )
+    core = FakeCore()
+    runtime = HubConnectorRuntime(
+        config,
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    runtime.identity = ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    runtime.session = HubSession(
+        session_id="hsess_1",
+        integration_instance_id="int_test",
+        lease_generation=1,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=90),
+        resume_cursor=None,
+    )
+    for index in range(3):
+        runtime.enqueue_event(
+            {
+                "time_fired": f"2026-08-03T08:00:0{index}Z",
+                "context": {"id": f"ctx-{index}"},
+                "data": {
+                    "new_state": {
+                        "entity_id": "sensor.batch",
+                        "state": str(index),
+                        "last_updated": f"2026-08-03T08:00:0{index}Z",
+                    }
+                },
+            }
+        )
+
+    assert runtime.flush_once() is True
+    assert core.events[0]["sequence_start"] == 1
+    assert core.events[0]["sequence_end"] == 2
+    assert runtime.queue.summary()["queue_depth"] == 1

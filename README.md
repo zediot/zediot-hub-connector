@@ -23,10 +23,10 @@ The repository contains one shared runtime with two distribution profiles:
 - Home Assistant Container/managed Linux companion container using a
   read-only long-lived-token file.
 
-Pairing, session, bounded replay, command receipt and local rule focused tests
-are required before publishing a versioned multi-architecture image. Internal
-Home Assistant Container enrollment/session/uplink smoke has passed; anonymous
-repository and registry access remains the public-release gate.
+Pairing, session recovery, bounded replay, command receipt and local rule
+focused tests are required before publishing a versioned multi-architecture
+image. Internal Home Assistant Container enrollment/session/uplink smoke must
+pass together with anonymous repository and registry access.
 
 ## Responsibilities
 
@@ -71,6 +71,9 @@ repository URL to ordinary users.
 - The pairing code is required only until a connector identity is persisted;
   an enrolled Connector must restart with the consumed code file empty.
 - Incremental `state_changed` events use a durable monotonic sequence.
+- Event uplink batches default to 50 items and are bounded to 1–100 so Core
+  projection completes within the Connector HTTP timeout instead of creating
+  overlapping retries.
 - The queue is bounded by both 24 hours and 100 MiB. Capacity overflow rejects
   the new item without breaking the acknowledged sequence prefix; age expiry
   clears the non-replayable tail back to the last Core ACK cursor. Both paths
@@ -82,3 +85,6 @@ repository URL to ordinary users.
   within 6–24 hours.
 - Core retries are bounded and protected by a closed/open/half-open circuit
   breaker.
+- Inactive, stale-generation, and expired Hub sessions are re-authenticated and
+  re-established automatically. Sequence gaps remain reconciliation errors and
+  do not trigger session replacement.

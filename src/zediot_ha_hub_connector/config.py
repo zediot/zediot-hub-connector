@@ -23,6 +23,7 @@ class ConnectorConfig:
     heartbeat_interval_seconds: int = 30
     queue_max_age_seconds: int = 86400
     queue_max_bytes: int = 100 * 1024 * 1024
+    event_batch_size: int = 50
     retry_max_attempts: int = 5
     retry_base_seconds: float = 1.0
     circuit_failure_threshold: int = 5
@@ -123,6 +124,14 @@ class ConnectorConfig:
                 maximum=100 * 1024 * 1024,
                 options=options,
                 option_key="queue_max_bytes",
+            ),
+            event_batch_size=_bounded_int(
+                "ZEDIOT_EVENT_BATCH_SIZE",
+                default=50,
+                minimum=1,
+                maximum=100,
+                options=options,
+                option_key="event_batch_size",
             ),
             trusted_rule_package_key_ids=_csv_set(
                 _value(

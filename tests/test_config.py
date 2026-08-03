@@ -56,6 +56,7 @@ def test_container_mode_reads_token_and_pairing_code_from_files(
     assert config.pairing_code == "henr_1.one-time-secret"
     assert config.runtime_kind == "home_assistant_container"
     assert config.installation_id == "nas-ha"
+    assert config.event_batch_size == 50
 
 
 def test_consumed_pairing_code_file_is_optional_after_enrollment(

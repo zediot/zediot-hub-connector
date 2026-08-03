@@ -86,7 +86,7 @@ class HomeAssistantClient:
                             **service_data,
                             "entity_id": entity_id,
                         },
-                        "return_response": True,
+                        "return_response": False,
                     }
                 )
             )

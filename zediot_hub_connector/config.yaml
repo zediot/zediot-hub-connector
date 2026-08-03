@@ -1,5 +1,5 @@
 name: ZedIoT Hub Connector
-version: 0.2.0
+version: 0.2.1
 slug: zediot_hub_connector
 description: Secure outbound Home Assistant connection to ZedIoT Core
 url: https://gitlab.osvie.com/zed.sites/zediot-hub-connector
@@ -19,6 +19,7 @@ options:
   heartbeat_interval_seconds: 30
   queue_max_age_seconds: 86400
   queue_max_bytes: 104857600
+  event_batch_size: 50
   rule_package_trusted_key_ids: rule-package-signing-v1
   rule_poll_interval_seconds: 5
   rule_evidence_max_rows: 5000
@@ -31,6 +32,7 @@ schema:
   heartbeat_interval_seconds: int(15,60)
   queue_max_age_seconds: int(3600,86400)
   queue_max_bytes: int(1048576,104857600)
+  event_batch_size: int(1,100)
   rule_package_trusted_key_ids: str
   rule_poll_interval_seconds: int(1,60)
   rule_evidence_max_rows: int(100,50000)

@@ -10,6 +10,15 @@ import httpx
 from zediot_ha_hub_connector.identity import ConnectorIdentity
 
 
+class HubSessionInvalidError(RuntimeError):
+    """The server rejected a session that must be re-established."""
+
+    def __init__(self, *, session_id: str, detail: str) -> None:
+        self.session_id = session_id
+        self.detail = detail
+        super().__init__(detail)
+
+
 @dataclass(frozen=True)
 class HubSession:
     session_id: str
@@ -338,6 +347,12 @@ class IoTCoreHubClient:
             json=json,
             headers=request_headers,
         )
+        invalid_session = _invalid_session_detail(response, path=path)
+        if invalid_session is not None:
+            raise HubSessionInvalidError(
+                session_id=_session_id_from_path(path),
+                detail=invalid_session,
+            )
         response.raise_for_status()
         body = response.json()
         return dict(body.get("data") or {})
@@ -349,3 +364,30 @@ def _parse_time(value: str | int | float) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
         timezone.utc
     )
+
+
+def _invalid_session_detail(
+    response: httpx.Response,
+    *,
+    path: str,
+) -> str | None:
+    if response.status_code != 409 or "/api/hub/v1/sessions/" not in path:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    detail = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(detail, str):
+        return None
+    if detail in {
+        "Hub session is not active",
+        "stale Hub session lease generation",
+        "Hub session lease expired",
+    }:
+        return detail
+    return None
+
+
+def _session_id_from_path(path: str) -> str:
+    return path.split("/sessions/", 1)[1].split("/", 1)[0]
