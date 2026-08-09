@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.3.0
+
+- Support pre-provisioned (one-device-one-secret) bootstrap: activate against
+  Core with a tenant/product/device triple, then wait for the user to bind the
+  gateway instead of failing the start-up.
+- Keep the pairing-code path as the default so existing installations upgrade
+  without configuration changes; the bootstrap mode is chosen per install and
+  recorded in the identity file.
+- Read the device secret only from a provisioning bundle file, never from an
+  Add-on option or environment variable, so it stays out of `/data/options.json`,
+  Supervisor diagnostics and `docker inspect`.
+- Hold the data plane closed until binding completes, so an activated but
+  unbound gateway cannot upload telemetry.
+- Expose `tenant_id`, `product_key`, `device_name`, `provisioning_bundle_file`
+  and `claim_code_file` as optional Add-on options; all are absent by default.
+- Raise package, Add-on, standalone Compose and environment-example versions to
+  `0.3.0`.
+
 ## 0.2.1
 
 - Add the public GitHub App Repository and GHCR release workflow for anonymous

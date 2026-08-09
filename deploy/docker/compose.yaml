@@ -1,6 +1,6 @@
 services:
   zediot-hub-connector:
-    image: ${ZEDIOT_CONNECTOR_IMAGE:-ghcr.io/zediot/zediot-hub-connector:0.2.1}
+    image: ${ZEDIOT_CONNECTOR_IMAGE:-ghcr.io/zediot/zediot-hub-connector:0.3.0}
     container_name: zediot-hub-connector
     restart: unless-stopped
     extra_hosts:
