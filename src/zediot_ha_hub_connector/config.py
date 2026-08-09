@@ -34,10 +34,31 @@ class ConnectorConfig:
     rule_poll_interval_seconds: int = 5
     rule_evidence_max_rows: int = 5000
     rule_evidence_retention_seconds: int = 7 * 24 * 60 * 60
+    # 待绑定轮询的退避区间（43 附录 A.5）。起步要快——用户刚输完绑定码
+    # 不该干等；上限要大——设备可能在仓库里放几天，固定短间隔会打出上万次
+    # 无谓请求并撞上 GW-12 的限流。
+    binding_poll_initial_seconds: float = 5.0
+    binding_poll_max_seconds: float = 300.0
+    # 运行时接收绑定码的文件（43 附录 A.7）。终端用户是在设备**已经在跑**
+    # 之后才拿到绑定码的，不能要求他重启容器。
+    claim_code_file: Path | None = None
+    # 预发放三元组（R6-S5-EDGE-01 / 43 附录 A.2）。与 pairing_code **并存**：
+    # 存量实例和模式 C 仍走配对码，出厂预置的设备走三元组。
+    #
+    # 放在末尾并给默认值，是为了不打断既有的 ConnectorConfig(...) 调用——
+    # A.9 要求存量路径不受影响，那也包括调用方的代码。
+    tenant_id: str | None = None
+    product_key: str | None = None
+    device_name: str | None = None
+    device_secret: str | None = None
 
     @classmethod
     def from_env(cls) -> "ConnectorConfig":
         options = _load_options()
+        # 预配置包也带 core_url（43 第 4.2 节的导出格式），让装机只需一个文件
+        bundle = _load_provisioning_bundle(options=options)
+        if bundle.get("core_url") and not os.getenv("ZEDIOT_CORE_URL"):
+            options = {**options, "core_url": options.get("core_url") or bundle["core_url"]}
         state_dir = Path(os.getenv("ZEDIOT_STATE_DIR", "/data")).resolve()
         state_dir.mkdir(parents=True, exist_ok=True)
         ha_auth_mode = (
@@ -95,6 +116,8 @@ class ConnectorConfig:
                 option_key="pairing_code",
             )
             or None,
+            **_provisioning_triple(options=options),
+            claim_code_file=_claim_code_file(state_dir=state_dir, options=options),
             ha_websocket_url=ha_websocket_url,
             ha_access_token=ha_access_token,
             ha_auth_mode=ha_auth_mode,
@@ -202,6 +225,90 @@ def _optional_secret_value(
             return ""
         return path.read_text(encoding="utf-8").strip()
     return str(os.getenv(name) or options.get(option_key) or "").strip()
+
+
+def _provisioning_triple(*, options: dict[str, object]) -> dict[str, str | None]:
+    """读出预发放三元组（43 附录 A.2）。
+
+    优先读**预配置包**：产线/镜像制作时写入单个 JSON 文件，内含
+    core_url + tenant_id + product_key + device_name + device_secret，
+    正是第 4.2 节导出的逐台格式。装机时手填四个字段既慢又容易错行，
+    而这份文件可以直接由导出结果切分得到。
+
+    密钥只从**文件**读，不接受环境变量明文——env 会出现在 `docker inspect`、
+    进程列表和崩溃转储里，而 device_secret 是设备的唯一凭据。
+    """
+    bundle = _load_provisioning_bundle(options=options)
+
+    def pick(key: str, env_name: str) -> str | None:
+        value = (
+            str(os.getenv(env_name) or "").strip()
+            or str(options.get(key) or "").strip()
+            or str(bundle.get(key) or "").strip()
+        )
+        return value or None
+
+    secret = _secret_from_file("ZEDIOT_DEVICE_SECRET_FILE") or str(
+        bundle.get("device_secret") or ""
+    ).strip()
+
+    return {
+        "tenant_id": pick("tenant_id", "ZEDIOT_TENANT_ID"),
+        "product_key": pick("product_key", "ZEDIOT_PRODUCT_KEY"),
+        "device_name": pick("device_name", "ZEDIOT_DEVICE_NAME"),
+        "device_secret": secret or None,
+    }
+
+
+def _claim_code_file(*, state_dir: Path, options: dict[str, object]) -> Path:
+    """绑定码的落点。
+
+    默认放在 state_dir 下：HA Add-on 的选项变更会写进这里，Compose 场景也
+    可以直接 `docker cp` 或挂卷写入，两种部署形态共用一条通路，不必各写一套。
+    """
+    configured = (
+        str(os.getenv("ZEDIOT_CLAIM_CODE_FILE") or "").strip()
+        or str(options.get("claim_code_file") or "").strip()
+    )
+    return Path(configured) if configured else state_dir / "claim_code"
+
+
+def _secret_from_file(file_env_name: str) -> str:
+    """只从文件读密钥，**不提供环境变量入口**。
+
+    env 会出现在 `docker inspect`、进程列表与崩溃转储里，而 device_secret
+    是这台设备的唯一凭据——它和 HA token 一样只能走 secret file。
+    """
+    raw_path = os.getenv(file_env_name, "").strip()
+    if not raw_path:
+        return ""
+    path = Path(raw_path)
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
+def _load_provisioning_bundle(*, options: dict[str, object]) -> dict[str, object]:
+    raw_path = (
+        str(os.getenv("ZEDIOT_PROVISIONING_BUNDLE_FILE") or "").strip()
+        or str(options.get("provisioning_bundle_file") or "").strip()
+    )
+    if not raw_path:
+        return {}
+    path = Path(raw_path)
+    if not path.is_file():
+        # 缺文件不是致命错误：可能这台设备走的是配对码路径，
+        # 引导逻辑会在拿不到任何凭据时才报错，那里的信息更完整
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"ZEDIOT_PROVISIONING_BUNDLE_FILE is not valid JSON: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise ValueError("provisioning bundle must be a JSON object")
+    return payload
 
 
 def _installation_id(

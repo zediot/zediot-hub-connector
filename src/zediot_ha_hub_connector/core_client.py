@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -8,6 +9,26 @@ from typing import Any
 import httpx
 
 from zediot_ha_hub_connector.identity import ConnectorIdentity
+
+
+class HubActivationError(RuntimeError):
+    """激活被服务端拒绝。
+
+    `terminal` 区分两类拒绝，这是 A.5 优雅等待的关键：
+
+      * terminal=True  —— 密钥错误、身份/批次被撤销、clone 可疑。重试没有
+        任何意义，必须停下来并把原因显示出来，否则设备会永远刷同一个错误。
+      * terminal=False —— 限流、5xx、时钟偏移。退避后重试是对的。
+
+    把两者混为一谈是这条改造最容易犯的错：要么该停的一直重试（日志噪音、
+    还会撞限流），要么该等的直接退出（用户明明只是还没输绑定码）。
+    """
+
+    def __init__(self, *, detail: str, status_code: int, terminal: bool) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.status_code = status_code
+        self.terminal = terminal
 
 
 class HubSessionInvalidError(RuntimeError):
@@ -68,6 +89,48 @@ class IoTCoreHubClient:
             },
             authenticated=False,
         )
+
+    def activate(
+        self,
+        *,
+        tenant_id: str,
+        product_key: str,
+        device_name: str,
+        device_secret: str,
+        public_key_pem: str,
+        installation_id: str,
+        health: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """预发放设备激活（43 第 4.3 节 / 附录 A.4）。
+
+        密钥在 TLS 内直接出示，**不做 HMAC 签名**：验证 HMAC 需要服务端持有
+        明文密钥，与"只存哈希"冲突（第 4.3 节偏差 1）。
+
+        这个调用同时兼作待绑定期的存活信标（GW-09）：同一把公钥重放是幂等的，
+        设备在等待绑定期间按退避周期重复调用即可，服务端据此记录 last_seen
+        并回当前 binding_state。
+        """
+        payload: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "product_key": product_key,
+            "device_name": device_name,
+            "device_secret": device_secret,
+            "public_key_pem": public_key_pem,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "nonce": uuid.uuid4().hex,
+            "installation_id": installation_id,
+        }
+        if health:
+            payload["health"] = health
+        try:
+            return self._request(
+                "POST",
+                "/api/hub/v1/gateways/activate",
+                json=payload,
+                authenticated=False,
+            )
+        except httpx.HTTPStatusError as error:
+            raise _activation_error(error) from error
 
     def enrollment_status(
         self,
@@ -391,3 +454,31 @@ def _invalid_session_detail(
 
 def _session_id_from_path(path: str) -> str:
     return path.split("/sessions/", 1)[1].split("/", 1)[0]
+
+
+# 服务端把"这台设备再也不该激活"和"现在不行、待会再来"用不同状态码表达：
+#   403 = 凭据无效或身份被锁（GW-12 的锁定也是 403，但它会自己到期）
+#   409 = 身份/批次被撤销、clone 可疑、产品停售——都要人介入
+#   429 = 限流，退避后重试
+#   4xx 其他 = 请求本身有问题（时钟偏移是 400），重试同样无意义
+_TERMINAL_ACTIVATION_STATUSES = frozenset({400, 403, 404, 409, 422})
+
+
+def _activation_error(error: httpx.HTTPStatusError) -> HubActivationError:
+    response = error.response
+    status_code = response.status_code
+    detail = ""
+    try:
+        body = response.json()
+        detail = str(body.get("data") or body.get("message") or "")
+    except ValueError:
+        detail = response.text[:200]
+    # 锁定是有期限的（GW-12 默认 900s），归为可重试——把它当终态会让一次
+    # 装机人员输错密钥就要求返厂
+    locked_out = "too many failed" in detail
+    terminal = status_code in _TERMINAL_ACTIVATION_STATUSES and not locked_out
+    return HubActivationError(
+        detail=detail or f"activation rejected with HTTP {status_code}",
+        status_code=status_code,
+        terminal=terminal,
+    )
