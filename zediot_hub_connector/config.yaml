@@ -1,5 +1,5 @@
 name: ZedIoT Hub Connector
-version: 0.3.0
+version: 0.3.1
 slug: zediot_hub_connector
 description: Secure outbound Home Assistant connection to ZedIoT Core
 url: https://github.com/zediot/zediot-hub-connector
@@ -11,6 +11,13 @@ homeassistant_api: true
 arch:
   - amd64
   - aarch64
+# 预发放安装要读一份凭据 JSON，而 Add-on 默认只看得到自己的 /data，
+# 用户没有通路把文件放进去——不映射 share 的话，下面那几个选项填了也没用。
+#
+# 用 rw 而不是 ro：绑定码是一次性凭证，读到后必须**删除**。只读挂载会让
+# 删除失败，把一个能把设备抢走的东西永久留在磁盘上。
+map:
+  - share:rw
 options:
   core_url: ""
   pairing_code: ""

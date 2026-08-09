@@ -1,0 +1,20 @@
+# 预发放（一机一密）安装的叠加配置。与 compose.yaml 一起使用：
+#
+#   docker compose -f compose.yaml -f compose.provisioned.yaml up -d
+#
+# 做成叠加文件而不是直接改 compose.yaml：配对码安装是默认路径，给它加一个
+# 必须存在的新 secret 文件，等于让每个不用预发放的用户先去建一个空文件。
+services:
+  zediot-hub-connector:
+    environment:
+      ZEDIOT_PROVISIONING_BUNDLE_FILE: /run/secrets/provisioning_bundle
+      # 绑定码落在 state 卷里：它是一次性凭证，读到即删，需要可写。
+      ZEDIOT_CLAIM_CODE_FILE: /data/claim_code
+    secrets:
+      - ha_token
+      - pairing_code
+      - provisioning_bundle
+
+secrets:
+  provisioning_bundle:
+    file: ./secrets/provisioning_bundle.json

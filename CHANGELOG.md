@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.3.1
+
+- Map `share` into the Add-on so a pre-provisioned install can actually read its
+  credential bundle. Without the mapping the container saw only its own `/data`,
+  which left the `0.3.0` provisioning options unusable on Home Assistant OS.
+- Map it read-write rather than read-only, because the one-time claim code must
+  be deleted after it is consumed.
+- Add `deploy/docker/compose.provisioned.yaml` and document the standalone
+  pre-provisioned install, which `0.3.0` shipped without any Compose wiring.
+
 ## 0.3.0
 
 - Support pre-provisioned (one-device-one-secret) bootstrap: activate against

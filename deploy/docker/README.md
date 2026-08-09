@@ -25,6 +25,43 @@ chmod 600 secrets/ha_token secrets/pairing_code
 docker compose up -d
 ```
 
+### Pre-provisioned install (one device, one secret)
+
+Use this instead of the pairing code when the gateway was pre-provisioned in a
+Core batch. Write the per-device bundle exported by Core, then start with the
+overlay file:
+
+```bash
+cd deploy/docker
+cp .env.example .env
+mkdir -p secrets
+printf '%s' '<HA_LONG_LIVED_TOKEN>' > secrets/ha_token
+: > secrets/pairing_code
+cat > secrets/provisioning_bundle.json <<'JSON'
+{
+  "core_url": "https://iotcore.example.com",
+  "tenant_id": "<TENANT_ID>",
+  "product_key": "<PRODUCT_KEY>",
+  "device_name": "<DEVICE_NAME>",
+  "device_secret": "<DEVICE_SECRET>"
+}
+JSON
+chmod 600 secrets/*
+docker compose -f compose.yaml -f compose.provisioned.yaml up -d
+```
+
+The bundle is exactly one row of the Core batch export, so no field has to be
+retyped at install time. `pairing_code` stays empty — the two bootstrap paths
+are mutually exclusive and the persisted identity records which one was used.
+
+The device secret is read only from this file. It has no environment-variable
+entry by design: `docker inspect`, the process list and crash dumps all expose
+environment values, and the secret is this device's only credential.
+
+After activation the gateway waits for the user to bind it in the IoT Core app.
+The data plane stays closed until binding completes, so an activated but unbound
+gateway uploads nothing. `docker logs` reports the wait; it is not an error.
+
 For a local source build:
 
 ```bash
