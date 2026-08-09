@@ -60,3 +60,28 @@ ws://host.docker.internal:8123/api/websocket
 
 Override `ZEDIOT_HA_WEBSOCKET_URL` when the NAS does not provide the
 `host-gateway` mapping.
+
+## Building for the NAS
+
+**Do not run `docker build` against the `fnnas` context.** That daemon resolves
+base images through `docker.fnnas.com`, which returns `401 Unauthorized` for
+`python:3.12-slim` — the build fails before it reads a single line of this
+Dockerfile.
+
+Build locally for the NAS architecture and ship the image over:
+
+```bash
+docker build --platform linux/amd64 \
+  -f deploy/docker/Dockerfile -t zediot-hub-connector:<tag> .
+
+docker save zediot-hub-connector:<tag> \
+  | docker --context fnnas load
+```
+
+The NAS runs `linux/amd64`; omitting `--platform` on an Apple Silicon machine
+produces an arm64 image that loads fine and then fails to start.
+
+Resist the temptation to "fix" this by switching the base image to the
+`python:3.11-slim` that the NAS happens to have cached. The project supports
+3.11, but the running connector is on 3.12 — swapping the production runtime
+to dodge a registry outage trades a known environment for an unverified one.
