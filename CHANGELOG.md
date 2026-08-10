@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.3.2
+
+- Stop the rule-package poll loop from busy-waiting on control directives. Core
+  returns the full list of revoked/expired packages on every claim rather than a
+  consumable queue, so counting each returned control as progress made the loop
+  skip its sleep forever. Measured on the test NAS at 52 requests per second,
+  sustained for six days after a single package was revoked.
+- Count a control as progress only when it actually changed local state.
+  `apply_control` already reported this; the caller discarded it.
+- Sleep a short minimum between polls even when there is work, so a future
+  mistake in the progress signal degrades to five requests per second instead of
+  fifty.
+- Correct the rule-runtime test double, which consumed control directives on
+  first delivery. Every rule test therefore ran in a world where this failure
+  mode could not occur.
+
 ## 0.3.1
 
 - Map `share` into the Add-on so a pre-provisioned install can actually read its

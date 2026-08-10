@@ -37,6 +37,9 @@ from zediot_ha_hub_connector.rule_runtime import (
 from zediot_ha_hub_connector.rule_store import LocalRuleStore
 from zediot_ha_hub_connector.snapshot import build_snapshot_uplink
 
+# 规则轮询在"有进展"时的最小间隔。见 _rule_loop 的说明。
+_RULE_DRAIN_MIN_INTERVAL_SECONDS = 0.2
+
 
 class HubConnectorRuntime:
     def __init__(
@@ -564,8 +567,18 @@ class HubConnectorRuntime:
         )
         processed = 0
         for control in delivery.get("controls") or []:
-            self.rule_store.apply_control(dict(control))
-            processed += 1
+            # 只把**真的改了本地状态**的 control 记成进展。
+            #
+            # Core 的 control 目录是一份"当前被撤销/过期的包"的**全量列表**，
+            # 不是一个会被消费掉的队列——同一条会在每次 claim 里原样返回。
+            # 之前无条件 processed += 1，于是 _rule_loop 认为"有活干"而跳过
+            # sleep，立刻再 claim，再拿到同一条……NAS 上实测 52 次/秒，从
+            # 包被撤销那天起连续跑了 6 天。
+            #
+            # apply_control 一直都返回"是否真的删掉了行"，这里以前把它丢了。
+            # 删除本身仍然每轮执行（幂等），所以包若重新出现照样会被清掉。
+            if self.rule_store.apply_control(dict(control)):
+                processed += 1
         for item in delivery.get("items") or []:
             package_id = str(item.get("package_id") or "")
             package_hash = str(item.get("payload_hash") or "")
@@ -706,6 +719,13 @@ class HubConnectorRuntime:
                 uploaded = self.flush_rule_evidence_once()
                 if not processed and not uploaded:
                     self.sleep(self.config.rule_poll_interval_seconds)
+                else:
+                    # 有活干时不等满一个轮询周期，但也不能一点不等。
+                    # "有进展"是个由被调用方推断出来的信号，判断错了就退化成
+                    # 忙等——这正是 control 目录踩过的坑。这里给一个下限，
+                    # 让同类错误的代价从"每秒几十次"降到"每秒五次"。
+                    # 排空 10 个包一批的正常场景，代价是每批多 0.2 秒。
+                    self.sleep(_RULE_DRAIN_MIN_INTERVAL_SECONDS)
             except HubSessionInvalidError as exc:
                 self._recover_after_session_error(exc)
             except Exception:

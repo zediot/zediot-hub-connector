@@ -29,8 +29,22 @@ class FakeCore:
         self.evidence_batches: list[list[dict]] = []
 
     def claim_rule_packages(self, **_kwargs):
-        response = self.package_response
-        self.package_response = {"items": [], "controls": []}
+        # items 是队列：claim 过一次就不再返回。
+        # controls **不是**——Core 侧 list_control_directives 是一句
+        # `SELECT ... WHERE status IN ('revoked','expired')`，没有消费语义，
+        # 同一条会在每次 claim 里原样带回。
+        #
+        # 这个假对象原先把 controls 也一并清空，于是所有规则测试都跑在一个
+        # "control 会被消费掉"的、不存在的世界里——真实环境下由此产生的忙等
+        # 因此从未被任何测试触及。
+        response = {
+            "items": list(self.package_response.get("items") or []),
+            "controls": list(self.package_response.get("controls") or []),
+        }
+        self.package_response = {
+            "items": [],
+            "controls": list(self.package_response.get("controls") or []),
+        }
         return response
 
     def acknowledge_rule_package(self, **kwargs):
@@ -176,6 +190,32 @@ def test_revoke_control_removes_package_and_prevents_new_execution(
     assert runtime.process_rule_packages_once() == 1
     runtime.enqueue_event(_state_event(context_id="ctx-revoked", state="on"))
     assert home_assistant.calls == []
+    assert runtime.rule_store.summary()["active_package_count"] == 0
+
+
+def test_repeated_revoke_control_is_not_counted_as_progress(tmp_path: Path):
+    """同一条 control 反复返回时不得再算作"有进展"。
+
+    Core 的 control 目录是全量列表而非队列：一个包被撤销后，**每次** claim
+    都会原样带回这条 control。_rule_loop 只在"没进展"时 sleep，所以只要这里
+    还返回非零，轮询就会退化成忙等——NAS 上实测 52 次/秒、连续 6 天。
+    """
+    delivery = _signed_delivery()
+    runtime, core, _ = _runtime(tmp_path, delivery=delivery)
+    runtime.process_rule_packages_once()
+    core.package_response = {
+        "items": [],
+        "controls": [
+            {"package_id": delivery["package_id"], "status": "revoked"}
+        ],
+    }
+
+    # 第一次真的删掉了本地包 -> 是进展
+    assert runtime.process_rule_packages_once() == 1
+    # 之后同一条 control 再来多少次都不该算进展
+    for _ in range(3):
+        assert runtime.process_rule_packages_once() == 0
+    # 删除本身仍然每轮执行，包不会复活
     assert runtime.rule_store.summary()["active_package_count"] == 0
 
 

@@ -1,5 +1,5 @@
 name: ZedIoT Hub Connector
-version: 0.3.1
+version: 0.3.2
 slug: zediot_hub_connector
 description: Secure outbound Home Assistant connection to ZedIoT Core
 url: https://github.com/zediot/zediot-hub-connector
