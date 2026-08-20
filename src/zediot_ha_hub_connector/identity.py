@@ -10,6 +10,9 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
+SIGNATURE_ALGORITHM_ED25519 = "Ed25519"
+
+
 # 引导模式（43 附录 A.3 / A.9）。存量实例的 connector_identity.json 里没有
 # 这个字段，读出来是 None——**必须**当作 pairing 处理，否则升级后会把已经
 # 在跑的设备判成"需要重新激活"，那正是 A.9 不可退让的那条。
@@ -30,6 +33,7 @@ class ConnectorIdentity:
     connector_id: str | None
     credential_id: str | None
     exchange_receipt: str | None
+    signature_algorithm: str = SIGNATURE_ALGORITHM_ED25519
     # --- 预发放路径新增（R6-S5-EDGE-02）---
     tenant_id: str | None = None
     product_key: str | None = None
@@ -49,6 +53,14 @@ class ConnectorIdentity:
         """
         return self.bootstrap_mode or BOOTSTRAP_PAIRING
 
+    def sign_challenge(self, message: bytes) -> bytes:
+        """Sign a Core challenge with the algorithm bound to this identity."""
+        if self.signature_algorithm != SIGNATURE_ALGORITHM_ED25519:
+            raise ValueError(
+                f"unsupported connector signature algorithm: {self.signature_algorithm}"
+            )
+        return self.private_key.sign(message)
+
 
 class ConnectorIdentityStore:
     def __init__(self, state_dir: Path) -> None:
@@ -60,12 +72,24 @@ class ConnectorIdentityStore:
     def load_or_create(self) -> ConnectorIdentity:
         private_key = self._load_or_create_key()
         state = self._load_state()
+        signature_algorithm = state.get("signature_algorithm")
+        if signature_algorithm is None:
+            # Legacy identities are Ed25519 by construction. Persist the inferred
+            # value so later restarts never reinterpret the existing key.
+            signature_algorithm = SIGNATURE_ALGORITHM_ED25519
+            state = {**state, "signature_algorithm": signature_algorithm}
+            self._write_private_json(self.state_path, state)
+        if signature_algorithm != SIGNATURE_ALGORITHM_ED25519:
+            raise ValueError(
+                f"unsupported connector signature algorithm: {signature_algorithm}"
+            )
         return ConnectorIdentity(
             private_key=private_key,
             enrollment_id=state.get("enrollment_id"),
             connector_id=state.get("connector_id"),
             credential_id=state.get("credential_id"),
             exchange_receipt=state.get("exchange_receipt"),
+            signature_algorithm=signature_algorithm,
             tenant_id=state.get("tenant_id"),
             product_key=state.get("product_key"),
             device_name=state.get("device_name"),

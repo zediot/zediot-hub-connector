@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timezone
@@ -39,6 +40,17 @@ from zediot_ha_hub_connector.snapshot import build_snapshot_uplink
 
 # 规则轮询在"有进展"时的最小间隔。见 _rule_loop 的说明。
 _RULE_DRAIN_MIN_INTERVAL_SECONDS = 0.2
+
+_GRANT_INVENTORY_READ = "inventory_read"
+_GRANT_STATE_UPLINK = "state_uplink"
+_GRANT_COMMAND_DOWNLINK = "command_downlink"
+_GRANT_LOCAL_RULE_RUNTIME = "local_rule_runtime"
+_EVENT_UPLINK_GRANTS = frozenset({_GRANT_STATE_UPLINK})
+_SUBSCRIPTION_GRANTS = _EVENT_UPLINK_GRANTS | {
+    _GRANT_LOCAL_RULE_RUNTIME,
+}
+
+logger = logging.getLogger(__name__)
 
 
 class HubConnectorRuntime:
@@ -82,6 +94,7 @@ class HubConnectorRuntime:
         )
         self.sleep = sleep
         self.stop_event = threading.Event()
+        self._shutdown_reason_code = "connector_shutdown"
         self._session_lock = threading.Lock()
         self.identity: ConnectorIdentity | None = None
         self.session: HubSession | None = None
@@ -157,6 +170,7 @@ class HubConnectorRuntime:
             display_name=self.config.display_name,
             public_key_pem=self.identity_store.public_key_pem(identity),
             runtime_kind=self.config.runtime_kind,
+            signature_algorithm=identity.signature_algorithm,
         )
         identity = self.identity_store.save_exchange(
             enrollment_id=exchanged["enrollment_id"],
@@ -188,6 +202,7 @@ class HubConnectorRuntime:
                     device_secret=self.config.device_secret,
                     public_key_pem=self.identity_store.public_key_pem(identity),
                     installation_id=self.config.installation_id,
+                    signature_algorithm=identity.signature_algorithm,
                     health=self._self_health(),
                 )
             except HubActivationError as error:
@@ -339,6 +354,9 @@ class HubConnectorRuntime:
                 self.identity.bound_space_node_id if self.identity else None
             ),
             "session_id": self.session.session_id if self.session else None,
+            "effective_grants": (
+                sorted(self.session.effective_grants) if self.session else []
+            ),
         }
 
     def _go_live(self, identity: ConnectorIdentity) -> None:
@@ -355,12 +373,14 @@ class HubConnectorRuntime:
             identity=identity,
             resume_cursor=self.cursor,
         )
-        self.local_rule_runtime = HomeAssistantLocalRuleRuntime(
-            store=self.rule_store,
-            home_assistant=self.home_assistant,
-            integration_instance_id=self.session.integration_instance_id,
-            trusted_key_ids=self.config.trusted_rule_package_key_ids,
-        )
+        self.local_rule_runtime = None
+        if self.session.allows(_GRANT_LOCAL_RULE_RUNTIME):
+            self.local_rule_runtime = HomeAssistantLocalRuleRuntime(
+                store=self.rule_store,
+                home_assistant=self.home_assistant,
+                integration_instance_id=self.session.integration_instance_id,
+                trusted_key_ids=self.config.trusted_rule_package_key_ids,
+            )
         server_cursor = dict(self.session.resume_cursor or {})
         acknowledged = int(server_cursor.get("uplink_sequence") or 0)
         self.cursor = server_cursor or {"uplink_sequence": acknowledged}
@@ -394,6 +414,8 @@ class HubConnectorRuntime:
         )
 
     def enqueue_reconciliation_if_needed(self, *, force: bool = False) -> bool:
+        if self.session and not self.session.allows(_GRANT_INVENTORY_READ):
+            return False
         required = self.queue.needs_reconciliation()
         if not force and not required:
             return False
@@ -404,7 +426,7 @@ class HubConnectorRuntime:
             self.queue.mark_reconciliation_queued()
         return True
 
-    def enqueue_event(self, event: dict[str, Any]) -> QueueItem:
+    def enqueue_event(self, event: dict[str, Any]) -> QueueItem | None:
         data = dict(event.get("data") or {})
         new_state = data.get("new_state")
         if not isinstance(new_state, dict):
@@ -424,6 +446,10 @@ class HubConnectorRuntime:
                     else "offline"
                 ),
             )
+        if self.session and not (
+            self.session.effective_grants & _EVENT_UPLINK_GRANTS
+        ):
+            return None
         return self.queue.enqueue(
             kind="event",
             payload={
@@ -445,6 +471,14 @@ class HubConnectorRuntime:
         if not items:
             return False
         first = items[0]
+        if first.kind == "snapshot" and not self.session.allows(
+            _GRANT_INVENTORY_READ
+        ):
+            return False
+        if first.kind == "event" and not (
+            self.session.effective_grants & _EVENT_UPLINK_GRANTS
+        ):
+            return False
         try:
             if first.kind == "snapshot":
                 payload = {
@@ -518,6 +552,8 @@ class HubConnectorRuntime:
     def process_commands_once(self) -> int:
         if not self.identity or not self.session:
             raise RuntimeError("HUB_SESSION_NOT_READY")
+        if not self.session.allows(_GRANT_COMMAND_DOWNLINK):
+            return 0
         deliveries = retry_bounded(
             lambda: self.core.claim_commands(
                 identity=self.identity,
@@ -554,6 +590,8 @@ class HubConnectorRuntime:
     def process_rule_packages_once(self) -> int:
         if not self.identity or not self.session:
             raise RuntimeError("HUB_SESSION_NOT_READY")
+        if not self.session.allows(_GRANT_LOCAL_RULE_RUNTIME):
+            return 0
         delivery = retry_bounded(
             lambda: self.core.claim_rule_packages(
                 identity=self.identity,
@@ -634,6 +672,8 @@ class HubConnectorRuntime:
     def flush_rule_evidence_once(self) -> int:
         if not self.identity or not self.session:
             raise RuntimeError("HUB_SESSION_NOT_READY")
+        if not self.session.allows(_GRANT_LOCAL_RULE_RUNTIME):
+            return 0
         items = self.rule_store.pending_evidence(limit=100)
         if not items:
             return 0
@@ -664,23 +704,71 @@ class HubConnectorRuntime:
         return len(accepted_ids)
 
     def run_forever(self) -> None:
-        self.prepare()
-        # prepare() 在未绑定时会一直等（A.5），走到这里理应已经绑定。
-        # 仍然显式确认一次：万一将来有人给 prepare 加了提前返回的分支，
-        # 这里会立刻炸而不是让数据面线程在未绑定状态下跑起来。
-        self.ensure_data_plane_open()
-        self.enqueue_snapshot(run_type="bootstrap")
-        threads = [
-            threading.Thread(target=self._subscription_loop, daemon=True),
-            threading.Thread(target=self._upload_loop, daemon=True),
-            threading.Thread(target=self._command_loop, daemon=True),
-            threading.Thread(target=self._rule_loop, daemon=True),
-            threading.Thread(target=self._maintenance_loop, daemon=True),
+        threads: list[threading.Thread] = []
+        try:
+            self.prepare()
+            # prepare() 在未绑定时会一直等（A.5），走到这里理应已经绑定。
+            # 仍然显式确认一次：万一将来有人给 prepare 加了提前返回的分支，
+            # 这里会立刻炸而不是让数据面线程在未绑定状态下跑起来。
+            self.ensure_data_plane_open()
+            if self.stop_event.is_set():
+                return
+            if self.session and self.session.allows(_GRANT_INVENTORY_READ):
+                self.enqueue_snapshot(run_type="bootstrap")
+            threads = self._runtime_threads()
+            for thread in threads:
+                thread.start()
+            while not self.stop_event.wait(0.5):
+                pass
+        finally:
+            self.stop_event.set()
+            self._disconnect_session()
+            for thread in threads:
+                thread.join(timeout=1)
+
+    def request_stop(self, *, reason_code: str = "connector_shutdown") -> None:
+        self._shutdown_reason_code = reason_code[:120]
+        self.stop_event.set()
+
+    def _runtime_threads(self) -> list[threading.Thread]:
+        if self.session is None:
+            raise RuntimeError("HUB_SESSION_NOT_READY")
+        targets: list[tuple[str, Any]] = []
+        if self.session.effective_grants & _SUBSCRIPTION_GRANTS:
+            targets.append(("hub-subscription", self._subscription_loop))
+        if self.session.effective_grants & (
+            _EVENT_UPLINK_GRANTS | {_GRANT_INVENTORY_READ}
+        ):
+            targets.append(("hub-upload", self._upload_loop))
+        if self.session.allows(_GRANT_COMMAND_DOWNLINK):
+            targets.append(("hub-command", self._command_loop))
+        if self.session.allows(_GRANT_LOCAL_RULE_RUNTIME):
+            targets.append(("hub-rule", self._rule_loop))
+        targets.append(("hub-maintenance", self._maintenance_loop))
+        return [
+            threading.Thread(name=name, target=target, daemon=True)
+            for name, target in targets
         ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+
+    def _disconnect_session(self) -> None:
+        with self._session_lock:
+            identity = self.identity
+            session = self.session
+            self.session = None
+        if identity is None or session is None:
+            return
+        try:
+            self.core.disconnect_session(
+                identity=identity,
+                session=session,
+                reason_code=self._shutdown_reason_code,
+            )
+        except Exception as error:  # noqa: BLE001
+            self.breaker.failure()
+            logger.warning(
+                "Hub session disconnect failed (%s)",
+                type(error).__name__,
+            )
 
     def _subscription_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -737,9 +825,13 @@ class HubConnectorRuntime:
             try:
                 self.heartbeat()
                 if (
-                    self.queue.needs_reconciliation()
-                    or time.monotonic() - last_reconciliation
-                    >= self.config.reconciliation_interval_seconds
+                    self.session
+                    and self.session.allows(_GRANT_INVENTORY_READ)
+                    and (
+                        self.queue.needs_reconciliation()
+                        or time.monotonic() - last_reconciliation
+                        >= self.config.reconciliation_interval_seconds
+                    )
                 ):
                     if self.enqueue_reconciliation_if_needed(
                         force=(
@@ -771,7 +863,9 @@ def _source_event_id(
 ) -> str:
     context = dict(event.get("context") or new_state.get("context") or {})
     if context.get("id"):
-        return f"ha:{context['id']}"
+        entity_id = str(new_state.get("entity_id") or "")
+        entity_digest = hashlib.sha256(entity_id.encode("utf-8")).hexdigest()[:16]
+        return f"ha:{context['id']}:{entity_digest}"
     basis = {
         "entity_id": new_state.get("entity_id"),
         "last_updated": new_state.get("last_updated"),

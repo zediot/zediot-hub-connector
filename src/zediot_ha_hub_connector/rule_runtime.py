@@ -359,7 +359,8 @@ def _event_identity(
         or datetime.now(UTC)
     )
     if context_id:
-        source_event_id = f"ha:{context_id}"
+        entity_digest = hashlib.sha256(entity_id.encode("utf-8")).hexdigest()[:16]
+        source_event_id = f"ha:{context_id}:{entity_digest}"
     else:
         digest = hashlib.sha256(
             f"{entity_id}:{event_time.isoformat()}:{new_state.get('state')}".encode(

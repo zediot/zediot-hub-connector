@@ -114,6 +114,7 @@ def _runtime(
         lease_generation=1,
         lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=90),
         resume_cursor=None,
+        effective_grants=frozenset({"local_rule_runtime"}),
     )
     from zediot_ha_hub_connector.rule_runtime import (
         HomeAssistantLocalRuleRuntime,

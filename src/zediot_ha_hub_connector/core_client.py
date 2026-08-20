@@ -8,7 +8,10 @@ from typing import Any
 
 import httpx
 
-from zediot_ha_hub_connector.identity import ConnectorIdentity
+from zediot_ha_hub_connector.identity import (
+    SIGNATURE_ALGORITHM_ED25519,
+    ConnectorIdentity,
+)
 
 
 class HubActivationError(RuntimeError):
@@ -47,6 +50,10 @@ class HubSession:
     lease_generation: int
     lease_expires_at: datetime
     resume_cursor: dict[str, Any] | None
+    effective_grants: frozenset[str] = frozenset()
+
+    def allows(self, grant: str) -> bool:
+        return grant in self.effective_grants
 
 
 class IoTCoreHubClient:
@@ -70,6 +77,7 @@ class IoTCoreHubClient:
         display_name: str,
         public_key_pem: str,
         runtime_kind: str,
+        signature_algorithm: str = SIGNATURE_ALGORITHM_ED25519,
     ) -> dict[str, Any]:
         enrollment_id = pairing_code.split(".", 1)[0]
         return self._request(
@@ -81,6 +89,7 @@ class IoTCoreHubClient:
                 "installation_id": installation_id,
                 "display_name": display_name,
                 "public_key_pem": public_key_pem,
+                "signature_algorithm": signature_algorithm,
                 "contract_version": "1.0",
                 "manifest": {
                     "runtime": runtime_kind,
@@ -99,6 +108,7 @@ class IoTCoreHubClient:
         device_secret: str,
         public_key_pem: str,
         installation_id: str,
+        signature_algorithm: str = SIGNATURE_ALGORITHM_ED25519,
         health: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """预发放设备激活（43 第 4.3 节 / 附录 A.4）。
@@ -116,6 +126,7 @@ class IoTCoreHubClient:
             "device_name": device_name,
             "device_secret": device_secret,
             "public_key_pem": public_key_pem,
+            "signature_algorithm": signature_algorithm,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "nonce": uuid.uuid4().hex,
             "installation_id": installation_id,
@@ -158,7 +169,15 @@ class IoTCoreHubClient:
             },
             authenticated=False,
         )
-        signature = identity.private_key.sign(
+        # A legacy Core may omit this additive field. That omission is compatible
+        # only with an existing Ed25519 identity; any explicit mismatch fails
+        # closed before proof generation.
+        challenge_algorithm = (
+            challenge.get("signature_algorithm") or SIGNATURE_ALGORITHM_ED25519
+        )
+        if challenge_algorithm != identity.signature_algorithm:
+            raise RuntimeError("HUB_SIGNATURE_ALGORITHM_MISMATCH")
+        signature = identity.sign_challenge(
             challenge["canonical_message"].encode("utf-8")
         )
         token = self._request(
@@ -202,6 +221,9 @@ class IoTCoreHubClient:
             resume_cursor=(
                 dict(row["resume_cursor"]) if row.get("resume_cursor") else None
             ),
+            effective_grants=frozenset(
+                str(item) for item in row.get("effective_grants") or []
+            ),
         )
 
     def heartbeat(
@@ -232,6 +254,28 @@ class IoTCoreHubClient:
                     else f"core_circuit_{circuit_state}"
                 ),
             },
+        )
+
+    def disconnect_session(
+        self,
+        *,
+        identity: ConnectorIdentity,
+        session: HubSession,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        # Shutdown must stay inside the container stop window. Re-authentication
+        # can require two network round trips and would extend credential life
+        # during teardown, so use only the token that owns this session.
+        if not self._token:
+            raise RuntimeError("HUB_TOKEN_MISSING")
+        return self._request(
+            "POST",
+            f"/api/hub/v1/sessions/{session.session_id}/disconnect",
+            json={
+                "lease_generation": session.lease_generation,
+                "reason_code": reason_code,
+            },
+            timeout_seconds=5,
         )
 
     def upload_snapshot(
@@ -398,17 +442,23 @@ class IoTCoreHubClient:
         json: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         authenticated: bool = True,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         request_headers = dict(headers or {})
         if authenticated:
             if not self._token:
                 raise RuntimeError("HUB_TOKEN_MISSING")
             request_headers["Authorization"] = f"Bearer {self._token}"
+        request_kwargs: dict[str, Any] = {
+            "json": json,
+            "headers": request_headers,
+        }
+        if timeout_seconds is not None:
+            request_kwargs["timeout"] = timeout_seconds
         response = self._client.request(
             method,
             f"{self.base_url}{path}",
-            json=json,
-            headers=request_headers,
+            **request_kwargs,
         )
         invalid_session = _invalid_session_detail(response, path=path)
         if invalid_session is not None:

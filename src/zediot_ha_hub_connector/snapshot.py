@@ -64,6 +64,8 @@ def _snapshot_objects(snapshot: HomeAssistantSnapshot) -> list[dict[str, Any]]:
                     "model": device.get("model"),
                     "entry_type": device.get("entry_type"),
                     "via_device_id": device.get("via_device_id"),
+                    "identifier_count": len(device.get("identifiers") or []),
+                    "connection_count": len(device.get("connections") or []),
                 },
                 "provenance": {
                     "source_kind": "ha_device_registry",

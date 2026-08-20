@@ -62,6 +62,7 @@ def _runtime(tmp_path: Path, core, home_assistant) -> HubConnectorRuntime:
         lease_generation=1,
         lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=90),
         resume_cursor=None,
+        effective_grants=frozenset({"command_downlink"}),
     )
     return runtime
 

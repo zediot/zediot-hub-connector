@@ -83,6 +83,15 @@ a second development truth source.
 - Pairing input is a self-contained one-time code returned by IoT Core.
 - The pairing code is required only until a connector identity is persisted;
   an enrolled Connector must restart with the consumed code file empty.
+- IoT Core is the authority for session `effective_grants`. The Connector starts
+  only the inventory, state, command, and local-rule loops allowed by that set;
+  a missing field is fail-closed and does not enable any data-plane capability.
+- `SIGTERM` and `SIGINT` trigger a bounded session disconnect before exit so a
+  normal container restart does not wait for the old Core lease to expire.
+- Connector proof-of-possession currently uses a persisted Ed25519 identity.
+  Enrollment and activation declare the credential-bound algorithm explicitly;
+  an authentication challenge that declares a different algorithm fails closed.
+  Rule-package signature verification is an independent trust contract.
 - Incremental `state_changed` events use a durable monotonic sequence.
 - Event uplink batches default to 50 items and are bounded to 1–100 so Core
   projection completes within the Connector HTTP timeout instead of creating

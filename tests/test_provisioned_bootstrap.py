@@ -218,6 +218,7 @@ def test_activation_then_binding_completes_without_crashing(tmp_path):
 
     # 前两轮不抛异常、不退出，只是继续轮询
     assert len(core.activate_calls) == 3
+    assert core.activate_calls[0]["signature_algorithm"] == "Ed25519"
     assert runtime.binding_state == BINDING_READY
     assert runtime.identity.effective_bootstrap_mode == BOOTSTRAP_PROVISIONED
     assert core.authenticated == 1
