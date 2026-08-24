@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import time
 from typing import Any
 
 from zediot_ha_hub_connector.command_store import CommandReceiptStore
@@ -15,9 +16,11 @@ class HubCommandExecutor:
         *,
         home_assistant: HomeAssistantClient,
         receipts: CommandReceiptStore,
+        sleep=time.sleep,
     ) -> None:
         self.home_assistant = home_assistant
         self.receipts = receipts
+        self.sleep = sleep
 
     def execute(self, delivery: dict[str, Any]) -> dict[str, Any]:
         command_id = str(delivery["command_id"])
@@ -68,6 +71,25 @@ class HubCommandExecutor:
                 reason_code="ha_service_call_failed",
                 evidence={},
             )
+        readback = self._wait_for_readback(
+            entity_id=envelope["entity_id"],
+            expected_state="on" if envelope["service"] == "turn_on" else "off",
+            command_deadline=_deadline(delivery["deadline_at"]),
+        )
+        if readback is None:
+            return self.receipts.save(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                envelope=envelope,
+                status="timeout",
+                reason_code="ha_readback_timeout",
+                evidence={
+                    "provider_request_id": str(result.get("request_id") or ""),
+                    "provider_result": "accepted",
+                    "device_result": "not_observed",
+                    "ack_observed_at": datetime.now(UTC).isoformat(),
+                },
+            )
         return self.receipts.save(
             command_id=command_id,
             idempotency_key=idempotency_key,
@@ -77,8 +99,29 @@ class HubCommandExecutor:
             evidence={
                 "provider_request_id": str(result.get("request_id") or ""),
                 "provider_result": "success",
+                "device_result": "readback_confirmed",
+                "readback": {
+                    "capability": "light.power",
+                    "parameters": {"value": readback["state"] == "on"},
+                },
+                "ack_observed_at": datetime.now(UTC).isoformat(),
             },
         )
+
+    def _wait_for_readback(
+        self,
+        *,
+        entity_id: str,
+        expected_state: str,
+        command_deadline: datetime,
+    ) -> dict[str, Any] | None:
+        deadline = min(command_deadline, datetime.now(UTC) + timedelta(seconds=5))
+        while datetime.now(UTC) < deadline:
+            state = self.home_assistant.read_entity_state(entity_id=entity_id)
+            if state and state.get("state") == expected_state:
+                return state
+            self.sleep(0.2)
+        return None
 
 
 def validate_command_envelope(envelope: dict[str, Any]) -> dict[str, Any]:

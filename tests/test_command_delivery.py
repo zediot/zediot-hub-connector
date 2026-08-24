@@ -25,10 +25,20 @@ class FakeCore:
 class FakeHomeAssistant:
     def __init__(self):
         self.calls = []
+        self.state = "off"
 
     def call_service(self, **kwargs):
         self.calls.append(kwargs)
+        self.state = "on" if kwargs["service"] == "turn_on" else "off"
         return {"request_id": "200"}
+
+    def read_entity_state(self, *, entity_id):
+        return {
+            "entity_id": entity_id,
+            "state": self.state,
+            "last_changed": "2026-08-24T00:00:00Z",
+            "last_updated": "2026-08-24T00:00:00Z",
+        }
 
 
 def _runtime(tmp_path: Path, core, home_assistant) -> HubConnectorRuntime:
@@ -92,6 +102,38 @@ def test_command_redelivery_reuses_terminal_receipt_without_duplicate_side_effec
     assert runtime.process_commands_once() == 1
     assert len(home_assistant.calls) == 1
     assert [item["status"] for item in core.acks] == ["executed", "executed"]
+    assert core.acks[0]["evidence"]["device_result"] == "readback_confirmed"
+    assert core.acks[0]["evidence"]["readback"] == {
+        "capability": "light.power",
+        "parameters": {"value": True},
+    }
+
+
+def test_command_readback_timeout_does_not_report_executed(tmp_path: Path):
+    delivery = {
+        "delivery_id": "hcmd_readback_timeout",
+        "command_id": "cmd_readback_timeout",
+        "idempotency_key": "hub-command:cmd_readback_timeout",
+        "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat(),
+        "envelope": {
+            "domain": "light",
+            "service": "turn_on",
+            "entity_id": "light.cold_room",
+            "service_data": {"entity_id": "light.cold_room"},
+        },
+    }
+    core = FakeCore(delivery)
+    home_assistant = FakeHomeAssistant()
+    home_assistant.read_entity_state = lambda **_kwargs: {
+        "entity_id": "light.cold_room",
+        "state": "off",
+    }
+    runtime = _runtime(tmp_path, core, home_assistant)
+
+    assert runtime.process_commands_once() == 1
+    assert core.acks[0]["status"] == "timeout"
+    assert core.acks[0]["reason_code"] == "ha_readback_timeout"
+    assert core.acks[0]["evidence"]["device_result"] == "not_observed"
 
 
 def test_command_allowlist_rejects_arbitrary_home_assistant_service(tmp_path: Path):

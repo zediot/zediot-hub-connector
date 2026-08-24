@@ -91,3 +91,41 @@ def test_ha_service_call_does_not_request_unsupported_response_data():
         "return_response": False,
     }
     assert "must-not-leak" not in str(result)
+
+
+def test_ha_entity_state_readback_is_bounded_to_requested_entity():
+    socket = FakeSocket()
+    socket.responses = [
+        {"type": "auth_required"},
+        {"type": "auth_ok"},
+        {
+            "id": 201,
+            "type": "result",
+            "success": True,
+            "result": [
+                {"entity_id": "light.other", "state": "off"},
+                {
+                    "entity_id": "light.command_smoke",
+                    "state": "on",
+                    "last_changed": "2026-08-24T00:00:00Z",
+                    "last_updated": "2026-08-24T00:00:01Z",
+                    "attributes": {"access_token": "must-not-survive"},
+                },
+            ],
+        },
+    ]
+    client = HomeAssistantClient(
+        access_token="must-not-leak",
+        websocket_url="ws://home-assistant.local:8123/api/websocket",
+        create_connection=lambda _url, **_kwargs: socket,
+    )
+
+    state = client.read_entity_state(entity_id="light.command_smoke")
+
+    assert state == {
+        "entity_id": "light.command_smoke",
+        "state": "on",
+        "last_changed": "2026-08-24T00:00:00Z",
+        "last_updated": "2026-08-24T00:00:01Z",
+    }
+    assert "must-not-survive" not in str(state)

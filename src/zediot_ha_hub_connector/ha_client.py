@@ -100,6 +100,22 @@ class HomeAssistantClient:
         finally:
             socket.close()
 
+    def read_entity_state(self, *, entity_id: str) -> dict[str, Any] | None:
+        socket = self._open()
+        try:
+            states = self._command(socket, 201, "get_states")
+            for state in states or []:
+                if state.get("entity_id") == entity_id:
+                    return {
+                        "entity_id": entity_id,
+                        "state": str(state.get("state") or ""),
+                        "last_changed": state.get("last_changed"),
+                        "last_updated": state.get("last_updated"),
+                    }
+            return None
+        finally:
+            socket.close()
+
     def _open(self) -> Any:
         socket = self._create_connection(
             self._websocket_url,

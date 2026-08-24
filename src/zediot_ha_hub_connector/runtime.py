@@ -80,6 +80,7 @@ class HubConnectorRuntime:
         self.command_executor = HubCommandExecutor(
             home_assistant=self.home_assistant,
             receipts=self.command_receipts,
+            sleep=sleep,
         )
         self.rule_store = LocalRuleStore(
             config.state_dir / "local_rule_runtime.sqlite3",
