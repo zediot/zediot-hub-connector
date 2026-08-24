@@ -38,6 +38,8 @@ runtime dependency; the persisted key-bound identity owns restart continuity.
 | Tenant, Integration Instance, grants | IoT Core |
 | Mapping and Core asset identity | IoT Core |
 | Final presence/latest/command state | IoT Core |
+| Long-term telemetry and audit | IoT Core |
+| Tuya private protocol behavior | GHE Proxy/Adapter |
 
 Queue retention must never create a gap in the Core-owned uplink cursor. When
 the byte limit is reached, the Connector preserves the already queued
@@ -47,8 +49,26 @@ Core ACK cursor. Startup also compares the persisted tail with the
 authoritative Core cursor and clears a tail that does not start at the next
 expected sequence. All three cases emit dropped-count evidence and require a
 full reconciliation snapshot before the runtime returns to steady state.
-| Long-term telemetry and audit | IoT Core |
-| Tuya private protocol behavior | GHE Proxy/Adapter |
+
+Each snapshot contains two bounded facets captured from the same Home Assistant
+read: inventory objects and current-state observations. Inventory remains the
+source-object ledger input; current state is projected by the Home Assistant
+profile and is not persisted by the Connector as authoritative cloud state.
+State values participate in the snapshot version so a state-only change is not
+mistaken for a duplicate inventory snapshot.
+
+The queue persists a delivery-attempt counter per item. A first delivery uses
+`realtime` only when it was collected while connected. Data collected while the
+circuit is open, and any retry after a failed or uncertain HTTP delivery, uses
+`replay`, including after restart. Replay preserves source event time and
+idempotency identity, and IoT Core treats it as historical evidence rather than
+new realtime authority.
+
+An uncertain HTTP delivery fences the entire pending queue, not only the batch
+that was handed to the client. Events may be appended while an upload is in
+flight; without this fence they could survive a failed predecessor with a false
+`realtime` label. The persisted attempt marker therefore advances every pending
+row before retry or restart recovery.
 
 ## Duplicate-source protection
 

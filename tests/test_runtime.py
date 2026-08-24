@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -19,6 +20,7 @@ from zediot_ha_hub_connector.snapshot import build_snapshot_uplink
 class FakeCore:
     def __init__(self, *, resume_cursor=None, grants=None):
         self.events = []
+        self.snapshots = []
         self.resume_cursor = resume_cursor
         self.grants = frozenset(
             grants
@@ -47,6 +49,10 @@ class FakeCore:
     def upload_events(self, *, identity, session, payload):
         self.events.append(payload)
         return {"cursor_after": payload["sequence_end"]}
+
+    def upload_snapshot(self, *, identity, session, payload):
+        self.snapshots.append(payload)
+        return {"cursor_after": payload["sequence"]}
 
     def disconnect_session(self, **kwargs):
         self.disconnects.append(kwargs)
@@ -112,6 +118,52 @@ def test_snapshot_includes_bounded_device_identity_evidence():
     )
     assert device["metadata"]["identifier_count"] == 1
     assert device["metadata"]["connection_count"] == 2
+
+
+def test_snapshot_carries_bounded_current_state_and_changes_its_version():
+    observed_at = datetime(2026, 8, 22, 8, 0, tzinfo=timezone.utc)
+
+    def build(state: str):
+        return build_snapshot_uplink(
+            HomeAssistantSnapshot(
+                observed_at=observed_at,
+                areas=[],
+                devices=[],
+                entities=[
+                    {"entity_id": "light.qa", "disabled_by": None},
+                    {"entity_id": "sensor.disabled", "disabled_by": "user"},
+                ],
+                states=[
+                    {
+                        "entity_id": "light.qa",
+                        "state": state,
+                        "last_changed": "2026-08-22T07:59:00Z",
+                        "last_updated": "2026-08-22T08:00:00Z",
+                        "attributes": {"access_token": "must-not-leave-ha"},
+                    },
+                    {
+                        "entity_id": "sensor.disabled",
+                        "state": "42",
+                        "last_updated": "2026-08-22T08:00:00Z",
+                    },
+                ],
+            ),
+            run_type="bootstrap",
+        )
+
+    online = build("on")
+    offline = build("off")
+
+    assert online["current_states"] == [
+        {
+            "entity_id": "light.qa",
+            "state": "on",
+            "last_changed": "2026-08-22T07:59:00Z",
+            "last_updated": "2026-08-22T08:00:00Z",
+        }
+    ]
+    assert online["source_version"] != offline["source_version"]
+    assert "access_token" not in str(online)
 
 
 def test_runtime_scopes_shared_ha_context_event_ids_by_entity(tmp_path: Path):
@@ -247,6 +299,339 @@ def test_runtime_flushes_contiguous_events_and_removes_acknowledged_rows(
     assert core.events[0]["sequence_start"] == 1
     assert core.events[0]["sequence_end"] == 2
     assert runtime.queue.summary()["queue_depth"] == 0
+
+
+def test_runtime_retries_failed_event_batch_as_offline_replay(tmp_path: Path):
+    class FlakyCore(FakeCore):
+        def upload_events(self, *, identity, session, payload):
+            self.events.append(payload)
+            if len(self.events) == 1:
+                raise httpx.ConnectError("offline")
+            return {"cursor_after": payload["sequence_end"]}
+
+    config = ConnectorConfig(
+        core_url="https://core.example",
+        display_name="Test",
+        installation_id="install-1",
+        pairing_code=None,
+        ha_websocket_url="ws://supervisor/core/websocket",
+        ha_access_token="supervisor",
+        ha_auth_mode="supervisor",
+        runtime_kind="home_assistant_addon",
+        state_dir=tmp_path,
+        retry_max_attempts=2,
+        retry_base_seconds=0,
+    )
+    core = FlakyCore()
+    runtime = HubConnectorRuntime(
+        config,
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    runtime.identity = ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    runtime.session = HubSession(
+        session_id="hsess_1",
+        integration_instance_id="int_test",
+        lease_generation=1,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=90),
+        resume_cursor=None,
+        effective_grants=frozenset({"state_uplink"}),
+    )
+    runtime.enqueue_event(
+        {
+            "time_fired": "2026-08-22T08:00:00Z",
+            "context": {"id": "ctx-offline-replay"},
+            "data": {
+                "new_state": {
+                    "entity_id": "light.qa",
+                    "state": "on",
+                    "last_updated": "2026-08-22T08:00:00Z",
+                }
+            },
+        }
+    )
+
+    assert runtime.flush_once() is True
+    assert len(core.events) == 2
+    first = core.events[0]["events"][0]
+    replayed = core.events[1]["events"][0]
+    assert first["delivery_mode"] == "realtime"
+    assert first["is_replay"] is False
+    assert replayed["delivery_mode"] == "replay"
+    assert replayed["is_replay"] is True
+    assert replayed["source_event_id"] == first["source_event_id"]
+    assert replayed["observed_at"] == first["observed_at"]
+    assert replayed["sequence"] == first["sequence"]
+    assert runtime.queue.summary()["queue_depth"] == 0
+
+
+def test_runtime_fences_event_queued_behind_failed_batch_as_replay(
+    tmp_path: Path,
+):
+    runtime_holder = {}
+
+    class FlakyCore(FakeCore):
+        def upload_events(self, *, identity, session, payload):
+            self.events.append(payload)
+            if len(self.events) == 1:
+                runtime_holder["runtime"].enqueue_event(
+                    {
+                        "time_fired": "2026-08-22T08:00:01Z",
+                        "context": {"id": "ctx-queued-behind"},
+                        "data": {
+                            "new_state": {
+                                "entity_id": "light.queued_behind",
+                                "state": "on",
+                                "last_updated": "2026-08-22T08:00:01Z",
+                            }
+                        },
+                    }
+                )
+                raise httpx.ConnectError("offline")
+            return {"cursor_after": payload["sequence_end"]}
+
+    config = ConnectorConfig(
+        core_url="https://core.example",
+        display_name="Test",
+        installation_id="install-1",
+        pairing_code=None,
+        ha_websocket_url="ws://supervisor/core/websocket",
+        ha_access_token="supervisor",
+        ha_auth_mode="supervisor",
+        runtime_kind="home_assistant_addon",
+        state_dir=tmp_path,
+        event_batch_size=1,
+        retry_max_attempts=2,
+        retry_base_seconds=0,
+    )
+    core = FlakyCore()
+    runtime = HubConnectorRuntime(
+        config,
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    runtime_holder["runtime"] = runtime
+    runtime.identity = ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    runtime.session = HubSession(
+        session_id="hsess_1",
+        integration_instance_id="int_test",
+        lease_generation=1,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=90),
+        resume_cursor=None,
+        effective_grants=frozenset({"state_uplink"}),
+    )
+    runtime.enqueue_event(
+        {
+            "time_fired": "2026-08-22T08:00:00Z",
+            "context": {"id": "ctx-attempted"},
+            "data": {
+                "new_state": {
+                    "entity_id": "light.attempted",
+                    "state": "on",
+                    "last_updated": "2026-08-22T08:00:00Z",
+                }
+            },
+        }
+    )
+
+    assert runtime.flush_once() is True
+    assert runtime.flush_once() is True
+    queued_behind = core.events[-1]["events"][0]
+    assert queued_behind["payload"]["new_state"]["entity_id"] == (
+        "light.queued_behind"
+    )
+    assert queued_behind["delivery_mode"] == "replay"
+    assert queued_behind["is_replay"] is True
+
+
+def test_runtime_retries_failed_snapshot_as_offline_replay(tmp_path: Path):
+    class FlakySnapshotCore(FakeCore):
+        def upload_snapshot(self, *, identity, session, payload):
+            self.snapshots.append(payload)
+            if len(self.snapshots) == 1:
+                raise httpx.ConnectError("offline")
+            return {"cursor_after": payload["sequence"]}
+
+    config = ConnectorConfig(
+        core_url="https://core.example",
+        display_name="Test",
+        installation_id="install-1",
+        pairing_code=None,
+        ha_websocket_url="ws://supervisor/core/websocket",
+        ha_access_token="supervisor",
+        ha_auth_mode="supervisor",
+        runtime_kind="home_assistant_addon",
+        state_dir=tmp_path,
+        retry_max_attempts=2,
+        retry_base_seconds=0,
+    )
+    core = FlakySnapshotCore()
+    runtime = HubConnectorRuntime(
+        config,
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    runtime.identity = ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    runtime.session = HubSession(
+        session_id="hsess_1",
+        integration_instance_id="int_test",
+        lease_generation=1,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=90),
+        resume_cursor=None,
+        effective_grants=frozenset({"inventory_read"}),
+    )
+    runtime.enqueue_snapshot(run_type="bootstrap")
+
+    assert runtime.flush_once() is True
+    assert len(core.snapshots) == 2
+    assert core.snapshots[0]["delivery_mode"] == "realtime"
+    assert core.snapshots[1]["delivery_mode"] == "replay"
+    assert core.snapshots[1]["sequence"] == core.snapshots[0]["sequence"]
+    assert runtime.queue.summary()["queue_depth"] == 0
+
+
+def test_runtime_preserves_offline_classification_from_enqueue_to_upload(
+    tmp_path: Path,
+):
+    config = ConnectorConfig(
+        core_url="https://core.example",
+        display_name="Test",
+        installation_id="install-1",
+        pairing_code=None,
+        ha_websocket_url="ws://supervisor/core/websocket",
+        ha_access_token="supervisor",
+        ha_auth_mode="supervisor",
+        runtime_kind="home_assistant_addon",
+        state_dir=tmp_path,
+        retry_base_seconds=0,
+    )
+    core = FakeCore()
+    runtime = HubConnectorRuntime(
+        config,
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    runtime.identity = ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    runtime.session = HubSession(
+        session_id="hsess_1",
+        integration_instance_id="int_test",
+        lease_generation=1,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=90),
+        resume_cursor=None,
+        effective_grants=frozenset({"state_uplink"}),
+    )
+    runtime.breaker.state = "open"
+    runtime.breaker.opened_at = 0
+    runtime.enqueue_event(
+        {
+            "time_fired": "2026-08-22T08:00:00Z",
+            "context": {"id": "ctx-collected-offline"},
+            "data": {
+                "new_state": {
+                    "entity_id": "light.qa",
+                    "state": "off",
+                    "last_updated": "2026-08-22T08:00:00Z",
+                }
+            },
+        }
+    )
+
+    runtime.breaker.state = "closed"
+    runtime.breaker.opened_at = None
+    assert runtime.flush_once() is True
+    uploaded = core.events[0]["events"][0]
+    assert uploaded["delivery_mode"] == "replay"
+    assert uploaded["is_replay"] is True
+
+
+def test_runtime_replays_unattempted_event_after_process_restart(tmp_path: Path):
+    config = ConnectorConfig(
+        core_url="https://core.example",
+        display_name="Test",
+        installation_id="install-1",
+        pairing_code=None,
+        ha_websocket_url="ws://supervisor/core/websocket",
+        ha_access_token="supervisor",
+        ha_auth_mode="supervisor",
+        runtime_kind="home_assistant_addon",
+        state_dir=tmp_path,
+        retry_base_seconds=0,
+    )
+    first_runtime = HubConnectorRuntime(
+        config,
+        core=FakeCore(),
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    first_runtime.enqueue_event(
+        {
+            "time_fired": "2026-08-22T08:00:00Z",
+            "context": {"id": "ctx-before-restart"},
+            "data": {
+                "new_state": {
+                    "entity_id": "light.qa",
+                    "state": "on",
+                    "last_updated": "2026-08-22T08:00:00Z",
+                }
+            },
+        }
+    )
+
+    core = FakeCore()
+    restarted = HubConnectorRuntime(
+        config,
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    restarted.identity = ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    restarted.session = HubSession(
+        session_id="hsess_restarted",
+        integration_instance_id="int_test",
+        lease_generation=2,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=90),
+        resume_cursor=None,
+        effective_grants=frozenset({"state_uplink"}),
+    )
+
+    assert restarted.flush_once() is True
+    uploaded = core.events[0]["events"][0]
+    assert uploaded["delivery_mode"] == "replay"
+    assert uploaded["is_replay"] is True
 
 
 def test_runtime_queues_reconciliation_after_capacity_drop(tmp_path: Path):

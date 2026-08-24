@@ -100,3 +100,76 @@ def test_server_cursor_discards_a_non_replayable_sequence_gap(tmp_path: Path):
     assert queue.summary()["dropped_count"] == 2
     assert queue.needs_reconciliation() is True
     assert queue.enqueue(kind="event", payload={"value": "fresh"}).sequence == 2
+
+
+def test_delivery_attempt_is_durable_across_queue_restart(tmp_path: Path):
+    path = tmp_path / "queue.sqlite3"
+    queue = BoundedUplinkQueue(
+        path,
+        max_bytes=1024,
+        max_age_seconds=3600,
+    )
+    item = queue.enqueue(kind="event", payload={"value": "pending"})
+
+    queue.mark_delivery_attempted(sequences=[item.sequence])
+    reopened = BoundedUplinkQueue(
+        path,
+        max_bytes=1024,
+        max_age_seconds=3600,
+    )
+
+    pending = reopened.peek_all(limit=10)
+    assert len(pending) == 1
+    assert pending[0].delivery_attempts == 1
+    assert pending[0].last_attempted_at is not None
+
+
+def test_existing_queue_schema_is_migrated_without_losing_pending_rows(tmp_path: Path):
+    path = tmp_path / "queue.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE uplink_queue (
+                sequence INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                byte_size INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO uplink_queue(sequence, kind, payload_json, byte_size, created_at)
+            VALUES (1, 'event', '{"value":"pending"}', 19, ?)
+            """,
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+
+    queue = BoundedUplinkQueue(
+        path,
+        max_bytes=1024,
+        max_age_seconds=3600,
+    )
+
+    pending = queue.peek_all(limit=10)
+    assert len(pending) == 1
+    assert pending[0].delivery_attempts == 1
+    assert pending[0].last_attempted_at is not None
+
+
+def test_transport_failure_marks_every_pending_row_as_replay(tmp_path: Path):
+    queue = BoundedUplinkQueue(
+        tmp_path / "queue.sqlite3",
+        max_bytes=1024,
+        max_age_seconds=3600,
+    )
+    first = queue.enqueue(kind="event", payload={"value": "attempted"})
+    queue.mark_delivery_attempted(sequences=[first.sequence])
+    queue.enqueue(kind="event", payload={"value": "queued-behind"})
+
+    queue.mark_pending_delivery_uncertain()
+
+    pending = queue.peek_all(limit=10)
+    assert [item.delivery_attempts for item in pending] == [1, 1]
+    assert all(item.last_attempted_at is not None for item in pending)

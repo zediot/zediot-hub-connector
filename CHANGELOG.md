@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Include bounded Home Assistant current-state observations in every bootstrap
+  and reconciliation snapshot so unchanged inventory cannot hide changed state.
+- Persist upload attempt evidence in the bounded SQLite queue. Connected first
+  delivery is realtime; circuit-open collection and any retry after a failed or
+  uncertain delivery, including after process restart, are replay while
+  preserving source identity and sequence.
+- Fence the complete pending queue after any uncertain HTTP delivery, including
+  items appended behind the failed batch. This closes the race where those
+  follower items could otherwise retain realtime delivery semantics after Core
+  recovery or Connector restart.
+
 ## 0.3.2
 
 - Stop the rule-package poll loop from busy-waiting on control directives. Core

@@ -13,7 +13,8 @@ def build_snapshot_uplink(
     run_type: str,
 ) -> dict[str, Any]:
     objects = _snapshot_objects(snapshot)
-    source_version = _source_version(objects)
+    current_states = _snapshot_current_states(snapshot)
+    source_version = _source_version(objects, current_states)
     observed_at = snapshot.observed_at.isoformat().replace("+00:00", "Z")
     return {
         "run_type": run_type,
@@ -27,6 +28,7 @@ def build_snapshot_uplink(
             "object_types": ["area", "device", "entity"],
         },
         "objects": objects,
+        "current_states": current_states,
     }
 
 
@@ -114,10 +116,39 @@ def _snapshot_objects(snapshot: HomeAssistantSnapshot) -> list[dict[str, Any]]:
     return objects
 
 
-def _source_version(objects: list[dict[str, Any]]) -> str:
+def _snapshot_current_states(snapshot: HomeAssistantSnapshot) -> list[dict[str, Any]]:
+    eligible_entities = {
+        str(entity.get("entity_id") or "")
+        for entity in snapshot.entities
+        if entity.get("entity_id") and not entity.get("disabled_by")
+    }
+    states: list[dict[str, Any]] = []
+    for source in snapshot.states:
+        entity_id = str(source.get("entity_id") or "")
+        if entity_id not in eligible_entities:
+            continue
+        last_updated = source.get("last_updated") or source.get("last_changed")
+        if not last_updated:
+            continue
+        raw_state = source.get("state")
+        states.append(
+            {
+                "entity_id": entity_id,
+                "state": "" if raw_state is None else str(raw_state),
+                "last_changed": source.get("last_changed"),
+                "last_updated": last_updated,
+            }
+        )
+    return sorted(states, key=lambda item: item["entity_id"])
+
+
+def _source_version(
+    objects: list[dict[str, Any]],
+    current_states: list[dict[str, Any]],
+) -> str:
     digest = hashlib.sha256(
         json.dumps(
-            objects,
+            {"objects": objects, "current_states": current_states},
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),

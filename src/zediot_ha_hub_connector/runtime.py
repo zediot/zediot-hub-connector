@@ -408,9 +408,12 @@ class HubConnectorRuntime:
 
     def enqueue_snapshot(self, *, run_type: str) -> QueueItem:
         snapshot = self.home_assistant.collect_snapshot()
+        payload = build_snapshot_uplink(snapshot, run_type=run_type)
+        if self.breaker.state != "closed":
+            payload["delivery_mode"] = "replay"
         return self.queue.enqueue(
             kind="snapshot",
-            payload=build_snapshot_uplink(snapshot, run_type=run_type),
+            payload=payload,
         )
 
     def enqueue_reconciliation_if_needed(self, *, force: bool = False) -> bool:
@@ -450,14 +453,15 @@ class HubConnectorRuntime:
             self.session.effective_grants & _EVENT_UPLINK_GRANTS
         ):
             return None
+        is_replay = self.breaker.state != "closed"
         return self.queue.enqueue(
             kind="event",
             payload={
                 "source_event_id": source_event_id,
                 "event_type": "state_changed",
                 "observed_at": observed_at,
-                "delivery_mode": "realtime",
-                "is_replay": False,
+                "delivery_mode": "replay" if is_replay else "realtime",
+                "is_replay": is_replay,
                 "payload": {"new_state": new_state},
             },
         )
@@ -481,16 +485,31 @@ class HubConnectorRuntime:
             return False
         try:
             if first.kind == "snapshot":
-                payload = {
-                    **first.payload,
-                    "sequence": first.sequence,
-                }
+                attempt = first.delivery_attempts
+                queued_as_replay = first.payload.get("delivery_mode") == "replay"
+
+                def upload_snapshot() -> dict[str, Any]:
+                    nonlocal attempt
+                    replay = queued_as_replay or attempt > 0
+                    payload = {
+                        **first.payload,
+                        "sequence": first.sequence,
+                        "delivery_mode": "replay" if replay else "realtime",
+                    }
+                    self.queue.mark_delivery_attempted(sequences=[first.sequence])
+                    attempt += 1
+                    try:
+                        return self.core.upload_snapshot(
+                            identity=self.identity,
+                            session=self.session,
+                            payload=payload,
+                        )
+                    except Exception:
+                        self.queue.mark_pending_delivery_uncertain()
+                        raise
+
                 receipt = retry_bounded(
-                    lambda: self.core.upload_snapshot(
-                        identity=self.identity,
-                        session=self.session,
-                        payload=payload,
-                    ),
+                    upload_snapshot,
                     max_attempts=self.config.retry_max_attempts,
                     base_seconds=self.config.retry_base_seconds,
                     sleep=self.sleep,
@@ -499,31 +518,48 @@ class HubConnectorRuntime:
                 acknowledged = int(receipt["cursor_after"])
             else:
                 event_items = _contiguous_events(items)
-                events = [
-                    {
-                        **item.payload,
-                        "sequence": item.sequence,
-                        "delivery_mode": (
-                            "realtime"
-                            if item.payload.get("delivery_mode") == "realtime"
-                            else "replay"
-                        ),
-                    }
+                attempt = max(item.delivery_attempts for item in event_items)
+                queued_as_replay = any(
+                    item.payload.get("delivery_mode") == "replay"
+                    or item.payload.get("is_replay") is True
                     for item in event_items
-                ]
-                payload = {
-                    "sequence_start": event_items[0].sequence,
-                    "sequence_end": event_items[-1].sequence,
-                    "source_version": f"ha:event:{event_items[-1].sequence}",
-                    "observed_at": events[-1]["observed_at"],
-                    "events": events,
-                }
+                )
+
+                def upload_events() -> dict[str, Any]:
+                    nonlocal attempt
+                    replay = queued_as_replay or attempt > 0
+                    events = [
+                        {
+                            **item.payload,
+                            "sequence": item.sequence,
+                            "delivery_mode": "replay" if replay else "realtime",
+                            "is_replay": replay,
+                        }
+                        for item in event_items
+                    ]
+                    payload = {
+                        "sequence_start": event_items[0].sequence,
+                        "sequence_end": event_items[-1].sequence,
+                        "source_version": f"ha:event:{event_items[-1].sequence}",
+                        "observed_at": events[-1]["observed_at"],
+                        "events": events,
+                    }
+                    self.queue.mark_delivery_attempted(
+                        sequences=[item.sequence for item in event_items]
+                    )
+                    attempt += 1
+                    try:
+                        return self.core.upload_events(
+                            identity=self.identity,
+                            session=self.session,
+                            payload=payload,
+                        )
+                    except Exception:
+                        self.queue.mark_pending_delivery_uncertain()
+                        raise
+
                 receipt = retry_bounded(
-                    lambda: self.core.upload_events(
-                        identity=self.identity,
-                        session=self.session,
-                        payload=payload,
-                    ),
+                    upload_events,
                     max_attempts=self.config.retry_max_attempts,
                     base_seconds=self.config.retry_base_seconds,
                     sleep=self.sleep,

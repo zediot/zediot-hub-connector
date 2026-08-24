@@ -15,6 +15,8 @@ class QueueItem:
     payload: dict[str, Any]
     created_at: datetime
     byte_size: int
+    delivery_attempts: int = 0
+    last_attempted_at: datetime | None = None
     accepted: bool = True
     drop_reason: str | None = None
 
@@ -65,8 +67,9 @@ class BoundedUplinkQueue:
             connection.execute(
                 """
                 INSERT INTO uplink_queue(
-                    sequence, kind, payload_json, byte_size, created_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    sequence, kind, payload_json, byte_size, created_at,
+                    delivery_attempts, last_attempted_at
+                ) VALUES (?, ?, ?, ?, ?, 0, NULL)
                 """,
                 (
                     sequence,
@@ -92,7 +95,8 @@ class BoundedUplinkQueue:
             )
             rows = connection.execute(
                 """
-                SELECT sequence, kind, payload_json, byte_size, created_at
+                SELECT sequence, kind, payload_json, byte_size, created_at,
+                       delivery_attempts, last_attempted_at
                 FROM uplink_queue
                 WHERE kind = ?
                 ORDER BY sequence
@@ -107,6 +111,10 @@ class BoundedUplinkQueue:
                 payload=json.loads(row[2]),
                 byte_size=int(row[3]),
                 created_at=datetime.fromisoformat(row[4]),
+                delivery_attempts=int(row[5]),
+                last_attempted_at=(
+                    datetime.fromisoformat(row[6]) if row[6] else None
+                ),
             )
             for row in rows
         ]
@@ -119,7 +127,8 @@ class BoundedUplinkQueue:
             )
             rows = connection.execute(
                 """
-                SELECT sequence, kind, payload_json, byte_size, created_at
+                SELECT sequence, kind, payload_json, byte_size, created_at,
+                       delivery_attempts, last_attempted_at
                 FROM uplink_queue
                 ORDER BY sequence
                 LIMIT ?
@@ -133,9 +142,46 @@ class BoundedUplinkQueue:
                 payload=json.loads(row[2]),
                 byte_size=int(row[3]),
                 created_at=datetime.fromisoformat(row[4]),
+                delivery_attempts=int(row[5]),
+                last_attempted_at=(
+                    datetime.fromisoformat(row[6]) if row[6] else None
+                ),
             )
             for row in rows
         ]
+
+    def mark_delivery_attempted(self, *, sequences: list[int]) -> None:
+        if not sequences:
+            return
+        attempted_at = datetime.now(timezone.utc).isoformat()
+        placeholders = ",".join("?" for _ in sequences)
+        with self._connect() as connection:
+            connection.execute(
+                f"""
+                UPDATE uplink_queue
+                SET delivery_attempts = delivery_attempts + 1,
+                    last_attempted_at = ?
+                WHERE sequence IN ({placeholders})
+                """,
+                (attempted_at, *sequences),
+            )
+
+    def mark_pending_delivery_uncertain(self) -> None:
+        """Fence every pending row as replay after one transport failure."""
+
+        attempted_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE uplink_queue
+                SET delivery_attempts = CASE
+                        WHEN delivery_attempts = 0 THEN 1
+                        ELSE delivery_attempts
+                    END,
+                    last_attempted_at = COALESCE(last_attempted_at, ?)
+                """,
+                (attempted_at,),
+            )
 
     def acknowledge_through(self, sequence: int) -> None:
         with self._connect() as connection:
@@ -254,8 +300,34 @@ class BoundedUplinkQueue:
                     kind TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     byte_size INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                    last_attempted_at TEXT
                 )
+                """
+            )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(uplink_queue)")
+            }
+            if "delivery_attempts" not in columns:
+                connection.execute(
+                    "ALTER TABLE uplink_queue ADD COLUMN delivery_attempts "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "last_attempted_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE uplink_queue ADD COLUMN last_attempted_at TEXT"
+                )
+            # Rows that predate this process are delivery-uncertain even when
+            # the previous process stopped before recording an HTTP attempt.
+            # Conservatively replay them; Core owns dedupe and ordering.
+            connection.execute(
+                """
+                UPDATE uplink_queue
+                SET delivery_attempts = 1,
+                    last_attempted_at = COALESCE(last_attempted_at, created_at)
+                WHERE delivery_attempts = 0
                 """
             )
             connection.execute(
