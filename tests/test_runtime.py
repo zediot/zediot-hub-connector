@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,6 +28,7 @@ class FakeCore:
             or {"inventory_read", "state_uplink", "presence_uplink"}
         )
         self.disconnects = []
+        self.heartbeats = []
 
     def enrollment_status(self, *, enrollment_id, exchange_receipt):
         return {"status": "approved"}
@@ -57,6 +59,10 @@ class FakeCore:
     def disconnect_session(self, **kwargs):
         self.disconnects.append(kwargs)
         return {"status": "disconnected"}
+
+    def heartbeat(self, **kwargs):
+        self.heartbeats.append(kwargs)
+        return {"status": "active"}
 
 
 class RecoveringFakeCore(FakeCore):
@@ -632,6 +638,321 @@ def test_runtime_replays_unattempted_event_after_process_restart(tmp_path: Path)
     uploaded = core.events[0]["events"][0]
     assert uploaded["delivery_mode"] == "replay"
     assert uploaded["is_replay"] is True
+
+
+def test_successful_heartbeat_closes_half_open_circuit_with_empty_queue(
+    tmp_path: Path,
+):
+    core = FakeCore(grants={"state_uplink"})
+    runtime = HubConnectorRuntime(
+        ConnectorConfig(
+            core_url="https://core.example",
+            display_name="Test",
+            installation_id="install-1",
+            pairing_code=None,
+            ha_websocket_url="ws://supervisor/core/websocket",
+            ha_access_token="supervisor",
+            ha_auth_mode="supervisor",
+            runtime_kind="home_assistant_addon",
+            state_dir=tmp_path,
+            circuit_recovery_seconds=0,
+        ),
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    runtime.identity = ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    runtime.session = core.connect_session(
+        identity=runtime.identity,
+        resume_cursor=None,
+    )
+    runtime.breaker.state = "open"
+    runtime.breaker.opened_at = 0
+
+    assert runtime.flush_once() is False
+    assert core.heartbeats[-1]["circuit_state"] == "half_open"
+    assert runtime.breaker.state == "closed"
+
+
+def test_maintenance_heartbeat_does_not_own_half_open_transition(
+    tmp_path: Path,
+):
+    core = FakeCore(grants={"state_uplink"})
+    runtime = HubConnectorRuntime(
+        ConnectorConfig(
+            core_url="https://core.example",
+            display_name="Test",
+            installation_id="install-1",
+            pairing_code=None,
+            ha_websocket_url="ws://supervisor/core/websocket",
+            ha_access_token="supervisor",
+            ha_auth_mode="supervisor",
+            runtime_kind="home_assistant_addon",
+            state_dir=tmp_path,
+        ),
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    runtime.identity = ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    runtime.session = core.connect_session(
+        identity=runtime.identity,
+        resume_cursor=None,
+    )
+    runtime.breaker.state = "half_open"
+
+    assert runtime.heartbeat() == {"status": "active"}
+    assert runtime.breaker.state == "half_open"
+
+
+@pytest.mark.parametrize(
+    ("queue_kind", "grants"),
+    (
+        ("snapshot", {"state_uplink"}),
+        ("event", {"command_downlink"}),
+    ),
+)
+def test_half_open_probe_recovers_with_ineligible_persisted_queue_head(
+    tmp_path: Path,
+    queue_kind: str,
+    grants: set[str],
+):
+    core = FakeCore(grants=grants)
+    runtime = HubConnectorRuntime(
+        ConnectorConfig(
+            core_url="https://core.example",
+            display_name="Test",
+            installation_id="install-1",
+            pairing_code=None,
+            ha_websocket_url="ws://supervisor/core/websocket",
+            ha_access_token="supervisor",
+            ha_auth_mode="supervisor",
+            runtime_kind="home_assistant_addon",
+            state_dir=tmp_path,
+            circuit_recovery_seconds=0,
+        ),
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    runtime.identity = ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    runtime.session = core.connect_session(
+        identity=runtime.identity,
+        resume_cursor=None,
+    )
+    runtime.queue.enqueue(kind=queue_kind, payload={"persisted": True})
+    runtime.breaker.state = "open"
+    runtime.breaker.opened_at = 0
+
+    assert runtime.flush_once() is False
+    assert core.heartbeats[-1]["circuit_state"] == "half_open"
+    assert runtime.breaker.current_state() == "closed"
+    assert runtime.queue.summary()["queue_depth"] == 1
+
+
+def test_stale_upload_success_does_not_close_after_newer_failure(
+    tmp_path: Path,
+):
+    core = FakeCore(grants={"state_uplink"})
+    runtime = HubConnectorRuntime(
+        ConnectorConfig(
+            core_url="https://core.example",
+            display_name="Test",
+            installation_id="install-1",
+            pairing_code=None,
+            ha_websocket_url="ws://supervisor/core/websocket",
+            ha_access_token="supervisor",
+            ha_auth_mode="supervisor",
+            runtime_kind="home_assistant_addon",
+            state_dir=tmp_path,
+            retry_base_seconds=0,
+            circuit_failure_threshold=1,
+        ),
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    runtime.identity = ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    runtime.session = core.connect_session(
+        identity=runtime.identity,
+        resume_cursor=None,
+    )
+    original_upload = core.upload_events
+
+    def upload_after_newer_failure(**kwargs):
+        runtime.breaker.failure()
+        return original_upload(**kwargs)
+
+    core.upload_events = upload_after_newer_failure  # type: ignore[method-assign]
+    runtime.enqueue_event(
+        {
+            "time_fired": "2026-08-26T18:00:00Z",
+            "context": {"id": "ctx-stale-success"},
+            "data": {
+                "new_state": {
+                    "entity_id": "light.stale_success",
+                    "state": "on",
+                    "last_updated": "2026-08-26T18:00:00Z",
+                }
+            },
+        }
+    )
+
+    assert runtime.flush_once() is True
+    assert runtime.breaker.current_state() == "open"
+    assert runtime.queue.summary()["queue_depth"] == 0
+
+
+def test_stale_session_recovery_success_does_not_close_after_newer_failure(
+    tmp_path: Path,
+):
+    core = RecoveringFakeCore()
+    runtime = HubConnectorRuntime(
+        ConnectorConfig(
+            core_url="https://core.example",
+            display_name="Test",
+            installation_id="install-1",
+            pairing_code=None,
+            ha_websocket_url="ws://supervisor/core/websocket",
+            ha_access_token="supervisor",
+            ha_auth_mode="supervisor",
+            runtime_kind="home_assistant_addon",
+            state_dir=tmp_path,
+            circuit_failure_threshold=1,
+        ),
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+    runtime.identity = ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+    runtime.session = HubSession(
+        session_id="hsess_stale",
+        integration_instance_id="int_test",
+        lease_generation=1,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=90),
+        resume_cursor=None,
+        effective_grants=core.grants,
+    )
+    original_connect = core.connect_session
+
+    def connect_after_newer_failure(**kwargs):
+        session = original_connect(**kwargs)
+        runtime.breaker.failure()
+        return session
+
+    core.connect_session = connect_after_newer_failure  # type: ignore[method-assign]
+
+    runtime._recover_after_session_error(
+        HubSessionInvalidError(
+            session_id="hsess_stale",
+            detail="Hub session is not active",
+        )
+    )
+
+    assert runtime.session.session_id == "hsess_recovered_1"
+    assert runtime.breaker.current_state() == "open"
+
+
+def test_upload_loop_logs_bounded_failure_evidence_without_error_text(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    runtime = HubConnectorRuntime(
+        ConnectorConfig(
+            core_url="https://core.example",
+            display_name="Test",
+            installation_id="install-1",
+            pairing_code=None,
+            ha_websocket_url="ws://supervisor/core/websocket",
+            ha_access_token="supervisor",
+            ha_auth_mode="supervisor",
+            runtime_kind="home_assistant_addon",
+            state_dir=tmp_path,
+        ),
+        core=FakeCore(),
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: runtime.request_stop(),
+    )
+
+    def fail_flush() -> bool:
+        raise RuntimeError("sensitive-upstream-detail")
+
+    runtime.flush_once = fail_flush  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING):
+        runtime._upload_loop()
+
+    assert "exception_type=RuntimeError" in caplog.text
+    assert "circuit_state=closed" in caplog.text
+    assert "queue_depth=0" in caplog.text
+    assert "sensitive-upstream-detail" not in caplog.text
+
+
+def test_upload_loop_survives_queue_summary_failure_while_logging(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    runtime = HubConnectorRuntime(
+        ConnectorConfig(
+            core_url="https://core.example",
+            display_name="Test",
+            installation_id="install-1",
+            pairing_code=None,
+            ha_websocket_url="ws://supervisor/core/websocket",
+            ha_access_token="supervisor",
+            ha_auth_mode="supervisor",
+            runtime_kind="home_assistant_addon",
+            state_dir=tmp_path,
+        ),
+        core=FakeCore(),
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: runtime.request_stop(),
+    )
+
+    def fail_flush() -> bool:
+        raise RuntimeError("sensitive-upstream-detail")
+
+    def fail_summary() -> dict[str, int]:
+        raise sqlite3.OperationalError("database is locked")
+
+    runtime.flush_once = fail_flush  # type: ignore[method-assign]
+    runtime.queue.summary = fail_summary  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING):
+        runtime._upload_loop()
+
+    assert "exception_type=RuntimeError" in caplog.text
+    assert "queue_depth=unavailable" in caplog.text
+    assert "database is locked" not in caplog.text
+    assert "sensitive-upstream-detail" not in caplog.text
 
 
 def test_runtime_queues_reconciliation_after_capacity_drop(tmp_path: Path):

@@ -28,7 +28,11 @@ from zediot_ha_hub_connector.identity import (
     ConnectorIdentityStore,
 )
 from zediot_ha_hub_connector.queue import BoundedUplinkQueue, QueueItem
-from zediot_ha_hub_connector.reliability import CircuitBreaker, retry_bounded
+from zediot_ha_hub_connector.reliability import (
+    CircuitBreaker,
+    CircuitPermit,
+    retry_bounded,
+)
 from zediot_ha_hub_connector.rule_package import (
     verify_rule_package_delivery,
 )
@@ -400,9 +404,10 @@ class HubConnectorRuntime:
         self,
         error: HubSessionInvalidError,
     ) -> None:
+        permit = self.breaker.observe()
         try:
             self._recover_session(stale_session_id=error.session_id)
-            self.breaker.success()
+            self.breaker.success(permit)
         except Exception:
             self.breaker.failure()
             self.sleep(1)
@@ -410,7 +415,7 @@ class HubConnectorRuntime:
     def enqueue_snapshot(self, *, run_type: str) -> QueueItem:
         snapshot = self.home_assistant.collect_snapshot()
         payload = build_snapshot_uplink(snapshot, run_type=run_type)
-        if self.breaker.state != "closed":
+        if self.breaker.current_state() != "closed":
             payload["delivery_mode"] = "replay"
         return self.queue.enqueue(
             kind="snapshot",
@@ -446,7 +451,7 @@ class HubConnectorRuntime:
                 event,
                 connectivity_state=(
                     "connected"
-                    if self.breaker.state == "closed"
+                    if self.breaker.current_state() == "closed"
                     else "offline"
                 ),
             )
@@ -454,7 +459,7 @@ class HubConnectorRuntime:
             self.session.effective_grants & _EVENT_UPLINK_GRANTS
         ):
             return None
-        is_replay = self.breaker.state != "closed"
+        is_replay = self.breaker.current_state() != "closed"
         return self.queue.enqueue(
             kind="event",
             payload={
@@ -468,21 +473,29 @@ class HubConnectorRuntime:
         )
 
     def flush_once(self) -> bool:
-        if not self.breaker.allow():
+        permit = self.breaker.allow()
+        if permit is None:
             return False
-        if not self.identity or not self.session:
-            raise RuntimeError("HUB_SESSION_NOT_READY")
-        items = self.queue.peek_all(limit=self.config.event_batch_size)
+        try:
+            if not self.identity or not self.session:
+                raise RuntimeError("HUB_SESSION_NOT_READY")
+            items = self.queue.peek_all(limit=self.config.event_batch_size)
+        except Exception:
+            self.breaker.failure()
+            raise
         if not items:
+            self._complete_half_open_probe(permit)
             return False
         first = items[0]
         if first.kind == "snapshot" and not self.session.allows(
             _GRANT_INVENTORY_READ
         ):
+            self._complete_half_open_probe(permit)
             return False
         if first.kind == "event" and not (
             self.session.effective_grants & _EVENT_UPLINK_GRANTS
         ):
+            self._complete_half_open_probe(permit)
             return False
         try:
             if first.kind == "snapshot":
@@ -569,8 +582,20 @@ class HubConnectorRuntime:
                 acknowledged = int(receipt["cursor_after"])
             self.queue.acknowledge_through(acknowledged)
             self.cursor["uplink_sequence"] = acknowledged
-            self.breaker.success()
+            self.breaker.success(permit)
             return True
+        except Exception:
+            self.breaker.failure()
+            raise
+
+    def _complete_half_open_probe(self, permit: CircuitPermit) -> None:
+        if not permit.half_open_probe:
+            return
+        try:
+            # The upload loop owns half-open probes. When there is no eligible
+            # payload, heartbeat is the bounded authenticated Core check.
+            self.heartbeat()
+            self.breaker.success(permit)
         except Exception:
             self.breaker.failure()
             raise
@@ -583,7 +608,7 @@ class HubConnectorRuntime:
             session=self.session,
             cursor=self.cursor,
             queue_summary=self.queue.summary(),
-            circuit_state=self.breaker.state,
+            circuit_state=self.breaker.current_state(),
         )
 
     def process_commands_once(self) -> int:
@@ -824,7 +849,25 @@ class HubConnectorRuntime:
                     self.sleep(0.5)
             except HubSessionInvalidError as exc:
                 self._recover_after_session_error(exc)
-            except Exception:
+            except Exception as exc:
+                try:
+                    queue_summary = self.queue.summary()
+                except Exception:
+                    queue_summary = {
+                        "queue_depth": "unavailable",
+                        "queue_bytes": "unavailable",
+                        "dropped_count": "unavailable",
+                    }
+                logger.warning(
+                    "Hub uplink flush failed exception_type=%s "
+                    "circuit_state=%s queue_depth=%s queue_bytes=%s "
+                    "dropped_count=%s",
+                    type(exc).__name__,
+                    self.breaker.current_state(),
+                    queue_summary["queue_depth"],
+                    queue_summary["queue_bytes"],
+                    queue_summary["dropped_count"],
+                )
                 self.sleep(1)
 
     def _command_loop(self) -> None:
