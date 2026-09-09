@@ -4,6 +4,7 @@ import hashlib
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
+from zediot_ha_hub_connector.event_identity import build_source_event_id
 from zediot_ha_hub_connector.ha_client import HomeAssistantClient
 from zediot_ha_hub_connector.rule_package import (
     VerifiedRulePackage,
@@ -348,26 +349,17 @@ def _event_identity(
 ) -> tuple[str, datetime, dict[str, Any]]:
     data = dict(event.get("data") or {})
     new_state = dict(data.get("new_state") or {})
-    entity_id = str(new_state.get("entity_id") or "")
-    if not entity_id:
+    if not str(new_state.get("entity_id") or ""):
         raise RuntimeError("HA_STATE_EVENT_MISSING_NEW_STATE")
-    context = dict(event.get("context") or new_state.get("context") or {})
-    context_id = str(context.get("id") or "")
     event_time = parse_time(
         event.get("time_fired")
         or new_state.get("last_updated")
         or datetime.now(UTC)
     )
-    if context_id:
-        entity_digest = hashlib.sha256(entity_id.encode("utf-8")).hexdigest()[:16]
-        source_event_id = f"ha:{context_id}:{entity_digest}"
-    else:
-        digest = hashlib.sha256(
-            f"{entity_id}:{event_time.isoformat()}:{new_state.get('state')}".encode(
-                "utf-8"
-            )
-        ).hexdigest()[:24]
-        source_event_id = f"haevt:{digest}"
+    # 与上行身份共用同一算法（event_identity.build_source_event_id）：本地规则
+    # 幂等键必须和 Core 侧幂等键指向同一个事件，否则同一 HA 事件在两条账上会被
+    # 当成两件事。
+    source_event_id = build_source_event_id(event, new_state)
     return source_event_id, event_time, new_state
 
 

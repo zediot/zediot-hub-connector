@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import threading
 import time
@@ -9,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from zediot_ha_hub_connector.config import ConnectorConfig
+from zediot_ha_hub_connector.event_identity import build_source_event_id
 from zediot_ha_hub_connector.command_executor import HubCommandExecutor
 from zediot_ha_hub_connector.command_store import CommandReceiptStore
 from zediot_ha_hub_connector.core_client import (
@@ -927,12 +927,27 @@ class HubConnectorRuntime:
 
 
 def _contiguous_events(items: list[QueueItem]) -> list[QueueItem]:
+    """从队首切出一段：连续 sequence、且 source_event_id 批内唯一。
+
+    序号不连续要截断（Core 要求批内 sequence 连续）。批内 source_event_id 重复
+    同样要截断——这是第二道保险：即便 id 生成再出问题（见 event_identity），也不会
+    把一个必被 Core 整批拒绝的批发出去，导致客户端反复重投同一坏批、永远推不进
+    （现网实测一条批次被拒 5946 次）。
+
+    截断而非丢弃：重复的那条留在队列里，下一轮成为批首单独发出，不与自己冲突，
+    因此不丢事件。每批至少含队首一条，不会截出空批。
+    """
     result: list[QueueItem] = []
     expected = items[0].sequence
+    seen_source_ids: set[str] = set()
     for item in items:
         if item.kind != "event" or item.sequence != expected:
             break
+        source_id = item.payload.get("source_event_id")
+        if source_id in seen_source_ids:
+            break
         result.append(item)
+        seen_source_ids.add(source_id)
         expected += 1
     return result
 
@@ -941,20 +956,9 @@ def _source_event_id(
     event: dict[str, Any],
     new_state: dict[str, Any],
 ) -> str:
-    context = dict(event.get("context") or new_state.get("context") or {})
-    if context.get("id"):
-        entity_id = str(new_state.get("entity_id") or "")
-        entity_digest = hashlib.sha256(entity_id.encode("utf-8")).hexdigest()[:16]
-        return f"ha:{context['id']}:{entity_digest}"
-    basis = {
-        "entity_id": new_state.get("entity_id"),
-        "last_updated": new_state.get("last_updated"),
-        "state": new_state.get("state"),
-    }
-    digest = hashlib.sha256(
-        json.dumps(basis, sort_keys=True).encode("utf-8")
-    ).hexdigest()[:24]
-    return f"haevt:{digest}"
+    # 单一真源见 event_identity.build_source_event_id；这里保留薄封装，仅为不改动
+    # 大量既有调用点。
+    return build_source_event_id(event, new_state)
 
 
 def _stable_runtime_id(prefix: str, value: str) -> str:
