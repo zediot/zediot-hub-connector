@@ -806,6 +806,8 @@ class HubConnectorRuntime:
             targets.append(("hub-command", self._command_loop))
         if self.session.allows(_GRANT_LOCAL_RULE_RUNTIME):
             targets.append(("hub-rule", self._rule_loop))
+        if self.session.allows(_GRANT_INVENTORY_READ):
+            targets.append(("hub-inventory", self._inventory_loop))
         targets.append(("hub-maintenance", self._maintenance_loop))
         return [
             threading.Thread(name=name, target=target, daemon=True)
@@ -900,29 +902,45 @@ class HubConnectorRuntime:
                 self.sleep(self.config.rule_poll_interval_seconds)
 
     def _maintenance_loop(self) -> None:
-        last_reconciliation = time.monotonic()
+        """只做心跳，不做别的。
+
+        这里原先还顺带触发对账（采 HA 全量快照）。采集是同步的，慢起来能占住线程
+        好几分钟，而租约只有 90 秒——心跳一停，会话必然过期。现网实测：心跳严格
+        每 30 秒、一次不落，然后突然静默约 3 分钟，随后换新会话，如此每 13-16 分钟
+        循环一次（6 小时 23 个会话，同期正常网关只有 2 个）。会话被自己的对账拖死，
+        快照因此永远传不上去，reconciliation_required 也就永远清不掉。
+
+        心跳是判定"这个客户端还活着"的唯一依据，它的线程不能承担任何可能变慢的
+        工作。对账移到 _inventory_loop。
+        """
         while not self.stop_event.wait(self.config.heartbeat_interval_seconds):
             try:
                 self.heartbeat()
-                if (
-                    self.session
-                    and self.session.allows(_GRANT_INVENTORY_READ)
-                    and (
-                        self.queue.needs_reconciliation()
-                        or time.monotonic() - last_reconciliation
-                        >= self.config.reconciliation_interval_seconds
-                    )
-                ):
-                    if self.enqueue_reconciliation_if_needed(
-                        force=(
-                            time.monotonic() - last_reconciliation
-                            >= self.config.reconciliation_interval_seconds
-                        )
-                    ):
-                        last_reconciliation = time.monotonic()
             except HubSessionInvalidError as exc:
                 self._recover_after_session_error(exc)
             except Exception:
+                self.breaker.failure()
+
+    def _inventory_loop(self) -> None:
+        """对账（采集并上传 HA 全量快照）。与心跳分开，慢也不会拖垮会话。"""
+        last_reconciliation = time.monotonic()
+        while not self.stop_event.wait(self.config.heartbeat_interval_seconds):
+            try:
+                if not (self.session and self.session.allows(_GRANT_INVENTORY_READ)):
+                    continue
+                due = (
+                    time.monotonic() - last_reconciliation
+                    >= self.config.reconciliation_interval_seconds
+                )
+                if not (self.queue.needs_reconciliation() or due):
+                    continue
+                if self.enqueue_reconciliation_if_needed(force=due):
+                    last_reconciliation = time.monotonic()
+            except HubSessionInvalidError as exc:
+                self._recover_after_session_error(exc)
+            except Exception:
+                # 采集失败（含 HA_SNAPSHOT_DEADLINE_EXCEEDED）不影响心跳，
+                # 下一轮按 needs_reconciliation 重来。
                 self.breaker.failure()
 
 

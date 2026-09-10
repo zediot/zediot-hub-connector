@@ -1213,6 +1213,9 @@ def test_runtime_starts_only_loops_allowed_by_effective_grants(tmp_path: Path):
     assert {thread.name for thread in runtime._runtime_threads()} == {
         "hub-subscription",
         "hub-upload",
+        # 对账独立成线程：采 HA 全量快照是同步且可能很慢的活，留在心跳线程里会
+        # 拖过租约把会话拖死。仅在有 inventory_read 授权时启动。
+        "hub-inventory",
         "hub-maintenance",
     }
 
