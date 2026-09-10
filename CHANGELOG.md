@@ -1,6 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.3.3
+
+- Split reconciliation out of the heartbeat loop. Collecting the Home Assistant
+  snapshot is synchronous and can occupy its thread for minutes, while the Hub
+  session lease is only 90 seconds, so a slow snapshot stopped the heartbeat and
+  killed the session. Observed in production: 23 sessions in six hours (a healthy
+  gateway had 2), heartbeats exactly every 30s then silent for ~3 minutes before
+  a new session. The dead session also meant the snapshot never uploaded, so
+  `reconciliation_required` never cleared and the cycle repeated every 13 minutes,
+  leaving newly assigned Home Assistant areas unable to reach Core.
+- Bound the whole snapshot collection with a hard deadline (20s, well under the
+  lease). A per-recv timeout cannot cap it because `_receive_non_ping` loops, so a
+  steady ping stream had no upper bound.
+- Fix `source_event_id` collisions within a batch. The id was
+  `ha:{context_id}:{sha(entity_id)}`, but a single Home Assistant context can carry
+  several state changes for the same entity, so two events produced one id and Core
+  rejected the whole batch as non-unique. One batch was rejected 5946 times, blocking
+  all uplink behind it. The id now folds in `last_updated`, both generators share one
+  implementation, and batch assembly truncates at a duplicate id as a second guard.
+
 
 - Include bounded Home Assistant current-state observations in every bootstrap
   and reconciliation snapshot so unchanged inventory cannot hide changed state.
