@@ -235,7 +235,7 @@ class IoTCoreHubClient:
         queue_summary: dict[str, int],
         circuit_state: str,
     ) -> dict[str, Any]:
-        self._ensure_token(identity)
+        self._ensure_token(identity, session=session)
         return self._request(
             "POST",
             f"/api/hub/v1/sessions/{session.session_id}/heartbeat",
@@ -285,7 +285,7 @@ class IoTCoreHubClient:
         session: HubSession,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        self._ensure_token(identity)
+        self._ensure_token(identity, session=session)
         return self._request(
             "POST",
             f"/api/hub/v1/sessions/{session.session_id}/snapshots",
@@ -302,7 +302,7 @@ class IoTCoreHubClient:
         session: HubSession,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        self._ensure_token(identity)
+        self._ensure_token(identity, session=session)
         return self._request(
             "POST",
             f"/api/hub/v1/sessions/{session.session_id}/events",
@@ -319,7 +319,7 @@ class IoTCoreHubClient:
         session: HubSession,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        self._ensure_token(identity)
+        self._ensure_token(identity, session=session)
         row = self._request(
             "POST",
             f"/api/hub/v1/sessions/{session.session_id}/commands/claim",
@@ -340,7 +340,7 @@ class IoTCoreHubClient:
         reason_code: str | None,
         evidence: dict[str, Any],
     ) -> dict[str, Any]:
-        self._ensure_token(identity)
+        self._ensure_token(identity, session=session)
         return self._request(
             "POST",
             (
@@ -362,7 +362,7 @@ class IoTCoreHubClient:
         session: HubSession,
         limit: int = 10,
     ) -> dict[str, Any]:
-        self._ensure_token(identity)
+        self._ensure_token(identity, session=session)
         return self._request(
             "POST",
             (
@@ -387,7 +387,7 @@ class IoTCoreHubClient:
         reason_code: str | None,
         evidence: dict[str, Any],
     ) -> dict[str, Any]:
-        self._ensure_token(identity)
+        self._ensure_token(identity, session=session)
         return self._request(
             "POST",
             (
@@ -412,7 +412,7 @@ class IoTCoreHubClient:
         session: HubSession,
         items: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        self._ensure_token(identity)
+        self._ensure_token(identity, session=session)
         return self._request(
             "POST",
             (
@@ -425,14 +425,49 @@ class IoTCoreHubClient:
             },
         )
 
-    def _ensure_token(self, identity: ConnectorIdentity) -> None:
+    def _ensure_token(
+        self,
+        identity: ConnectorIdentity,
+        *,
+        session: HubSession | None = None,
+    ) -> None:
+        """确保 bearer 可用；若在会话存续期间换了令牌，必须把会话一并换绑。
+
+        Core 把会话绑在签发它的那个令牌的 jti 上（_ensure_session_token_binding）。
+        换了令牌却不换绑，之后每一次心跳都会被判 403
+        "Hub session token binding mismatch"。而 403 不在「需重建会话」的判据里，
+        客户端只会一直空转，直到 90 秒租约自然过期才收到 409。
+
+        实测表现为每 ~16 分钟丢一次会话：令牌 900 秒、提前 60 秒续签 ⇒ 每 ~14 分钟
+        换一次令牌，换完 403 空转 ~2 分钟。现网 6 小时 22 个会话（同期正常网关 2 个），
+        审计里 13 次 hub.auth.token.issue 对 0 次 hub.session.token_rebind。
+
+        connect_session 建会话时还没有会话可换绑，因此那一处不传 session。
+        断开会话同样不传：拆除必须用拥有该会话的那个令牌，不能因为到了续签窗口
+        就重新签发（见 test_session_parses_effective_grants_and_disconnects_the_same_lease）。
+        """
         if (
-            self._token is None
-            or self._token_expires_at is None
-            or (self._token_expires_at - datetime.now(timezone.utc)).total_seconds()
-            < 60
+            self._token is not None
+            and self._token_expires_at is not None
+            and (self._token_expires_at - datetime.now(timezone.utc)).total_seconds()
+            >= 60
         ):
-            self.authenticate(identity)
+            return
+        self.authenticate(identity)
+        if session is not None:
+            self._rebind_session_token(session)
+
+    def _rebind_session_token(self, session: HubSession) -> None:
+        """把运行中的会话换绑到刚签发的令牌上。
+
+        换绑不改变 lease_generation：请求体带当前代次做乐观并发，Core 校验通过后
+        只更新会话的 token_binding_hash。
+        """
+        self._request(
+            "POST",
+            f"/api/hub/v1/sessions/{session.session_id}/token",
+            json={"lease_generation": session.lease_generation},
+        )
 
     def _request(
         self,
@@ -484,19 +519,31 @@ def _invalid_session_detail(
     *,
     path: str,
 ) -> str | None:
-    if response.status_code != 409 or "/api/hub/v1/sessions/" not in path:
+    if "/api/hub/v1/sessions/" not in path:
+        return None
+    if response.status_code not in {403, 409}:
         return None
     try:
         payload = response.json()
     except ValueError:
         return None
-    detail = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(detail, str):
+    data = payload.get("data") if isinstance(payload, dict) else None
+    # 409 的 data 是一个字符串；403 的 data 可能是 {"reason_code":..., "detail":...}。
+    detail: str | None = None
+    if isinstance(data, str):
+        detail = data
+    elif isinstance(data, dict) and isinstance(data.get("detail"), str):
+        detail = data["detail"]
+    if detail is None:
         return None
     if detail in {
         "Hub session is not active",
         "stale Hub session lease generation",
         "Hub session lease expired",
+        # 403：令牌换了而会话没换绑。没有这两条，客户端会拿新令牌反复打旧会话，
+        # 直到租约过期才收到 409 —— 中间那 90 秒全是必然失败的心跳。
+        "Hub session token binding mismatch",
+        "Hub session has no token binding",
     }:
         return detail
     return None

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.4
+
+- Rebind the live session whenever the access token is rotated. Core binds a
+  session to the jti of the token that created it, so refreshing the token
+  without calling `POST /sessions/{id}/token` made every subsequent heartbeat
+  fail with 403 `Hub session token binding mismatch`. 403 was not in the
+  "session must be re-established" set, so the client spun until the 90s lease
+  expired and only then got a 409 and rebuilt. Observed in production: the
+  token is requested with a hardcoded 900s TTL and refreshed 60s early, so the
+  connector lost its session roughly every 16 minutes (14 minutes of healthy
+  30s heartbeats, then ~2 minutes of guaranteed-failing ones). Six hours showed
+  22 sessions where a healthy gateway had 2, and the audit trail showed 13
+  `hub.auth.token.issue` against 0 `hub.session.token_rebind`.
+- Treat a 403 carrying `Hub session token binding mismatch` or
+  `Hub session has no token binding` as "re-establish the session", so any
+  future binding drift costs one session rebuild instead of 90 seconds of
+  failing heartbeats. 403 bodies carry the detail under `data.detail` rather
+  than as a bare string, which the parser now handles.
+- `connect_session` and `disconnect_session` deliberately do not rebind:
+  the former has no session yet, and teardown must keep using the token that
+  owns the session rather than minting a fresh one at the refresh boundary.
+
 ## 0.3.3
 
 - Split reconciliation out of the heartbeat loop. Collecting the Home Assistant

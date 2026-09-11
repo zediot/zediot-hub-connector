@@ -305,3 +305,146 @@ def test_session_conflict_classifies_only_recoverable_session_errors():
             "POST",
             "/api/hub/v1/sessions/hsess_active/events",
         )
+
+
+def _token_refresh_handler(requests: list[httpx.Request]):
+    """伪造 challenge/token/rebind/heartbeat 四条路由。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path == "/api/hub/v1/auth/challenges":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "challenge_id": "hchal-1",
+                        "nonce": "nonce-1",
+                        "canonical_message": "canonical-1",
+                    }
+                },
+            )
+        if path == "/api/hub/v1/auth/token":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "access_token": "fresh-token",
+                        "expires_at": "2099-01-01T00:00:00Z",
+                    }
+                },
+            )
+        return httpx.Response(200, json={"data": {"status": "ok"}})
+
+    return handler
+
+
+def _identity() -> ConnectorIdentity:
+    return ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr-1",
+        connector_id="hub-1",
+        credential_id="hcred-1",
+        exchange_receipt="receipt-1",
+    )
+
+
+def _live_session() -> "object":
+    from zediot_ha_hub_connector.core_client import HubSession
+
+    return HubSession(
+        session_id="hsess-1",
+        integration_instance_id="int-1",
+        lease_generation=7,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        resume_cursor=None,
+        effective_grants=frozenset({"state_uplink"}),
+    )
+
+
+def test_token_refresh_during_a_live_session_rebinds_that_session():
+    """会话存续期间换了令牌，必须把会话换绑过去。
+
+    Core 把会话绑在签发它的那个令牌的 jti 上。换了令牌不换绑，之后每一次心跳都被判
+    403 "Hub session token binding mismatch"，而 403 不在「需重建会话」的判据里，
+    客户端只能空转到 90 秒租约过期才收到 409。现网实测：6 小时 22 个会话（同期正常
+    网关 2 个），审计里 13 次 token.issue 对 0 次 token_rebind。
+    """
+    requests: list[httpx.Request] = []
+    client = IoTCoreHubClient(
+        base_url="https://core.example",
+        client=httpx.Client(transport=httpx.MockTransport(_token_refresh_handler(requests))),
+    )
+    # 令牌已进入续签窗口（剩余 < 60 秒）。
+    client._token = "stale-token"
+    client._token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=5)
+
+    client.heartbeat(
+        identity=_identity(),
+        session=_live_session(),
+        cursor={},
+        queue_summary={"queue_depth": 0, "queue_bytes": 0, "dropped_count": 0},
+        circuit_state="closed",
+    )
+
+    paths = [r.url.path for r in requests]
+    assert "/api/hub/v1/auth/token" in paths, "应当重新签发令牌"
+    assert "/api/hub/v1/sessions/hsess-1/token" in paths, "换发令牌后必须换绑会话"
+    # 换绑必须发生在心跳之前，否则那一次心跳仍会撞上 403。
+    assert paths.index("/api/hub/v1/sessions/hsess-1/token") < paths.index(
+        "/api/hub/v1/sessions/hsess-1/heartbeat"
+    )
+    rebind = next(
+        r for r in requests if r.url.path == "/api/hub/v1/sessions/hsess-1/token"
+    )
+    assert json.loads(rebind.content.decode("utf-8")) == {"lease_generation": 7}
+
+
+def test_token_still_valid_does_not_rebind():
+    """没换令牌就不该换绑：换绑会无谓地把旧令牌的 MQTT 认证能力提前作废。"""
+    requests: list[httpx.Request] = []
+    client = IoTCoreHubClient(
+        base_url="https://core.example",
+        client=httpx.Client(transport=httpx.MockTransport(_token_refresh_handler(requests))),
+    )
+    client._token = "good-token"
+    client._token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    client.heartbeat(
+        identity=_identity(),
+        session=_live_session(),
+        cursor={},
+        queue_summary={"queue_depth": 0, "queue_bytes": 0, "dropped_count": 0},
+        circuit_state="closed",
+    )
+
+    paths = [r.url.path for r in requests]
+    assert "/api/hub/v1/auth/token" not in paths
+    assert "/api/hub/v1/sessions/hsess-1/token" not in paths
+
+
+def test_binding_mismatch_403_asks_for_a_fresh_session():
+    """403 的绑定不匹配也要触发重建，而不是空转到租约过期。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={"data": {"detail": "Hub session token binding mismatch"}},
+        )
+
+    client = IoTCoreHubClient(
+        base_url="https://core.example",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    client._token = "good-token"
+    client._token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    with pytest.raises(HubSessionInvalidError) as excinfo:
+        client.heartbeat(
+            identity=_identity(),
+            session=_live_session(),
+            cursor={},
+            queue_summary={"queue_depth": 0, "queue_bytes": 0, "dropped_count": 0},
+            circuit_state="closed",
+        )
+    assert excinfo.value.session_id == "hsess-1"
