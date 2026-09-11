@@ -70,6 +70,28 @@ flight; without this fence they could survive a failed predecessor with a false
 `realtime` label. The persisted attempt marker therefore advances every pending
 row before retry or restart recovery.
 
+## Session token binding
+
+IoT Core binds a session to the JTI of the token that created it. A refreshed
+token does not inherit that binding: the connector must call
+`POST /api/hub/v1/sessions/{session_id}/token` with the current
+`lease_generation` whenever it mints a new access token while a session is
+still open. Rebinding does not change the lease generation; it only moves the
+binding to the new token.
+
+Skipping the rebind is not a degraded mode, it is a stall. Every later
+heartbeat is answered with 403 `Hub session token binding mismatch`, and 403 is
+not one of the conditions that re-establish a session, so the connector keeps
+sending doomed heartbeats until the 90-second lease expires and Core finally
+answers 409. Production showed the cost: a 900-second token refreshed 60
+seconds early produced roughly 14 good minutes and 2 dead ones, 22 sessions in
+six hours where a healthy gateway had 2, and an audit trail of 13
+`hub.auth.token.issue` against 0 `hub.session.token_rebind`.
+
+Two call sites deliberately do not rebind. Session creation has no session to
+rebind yet, and teardown must keep using the token that owns the session rather
+than minting a fresh one at the refresh boundary.
+
 ## Duplicate-source protection
 
 Devices already managed by a direct provider integration must not be created a

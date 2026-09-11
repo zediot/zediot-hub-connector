@@ -107,6 +107,9 @@ a second development truth source.
   within 6–24 hours.
 - Core retries are bounded and protected by a closed/open/half-open circuit
   breaker.
-- Inactive, stale-generation, and expired Hub sessions are re-authenticated and
-  re-established automatically. Sequence gaps remain reconciliation errors and
-  do not trigger session replacement.
+- Inactive, stale-generation, expired, and binding-mismatched Hub sessions are
+  re-authenticated and re-established automatically. Sequence gaps remain
+  reconciliation errors and do not trigger session replacement.
+- A token refreshed while a session is open must be rebound onto that session
+  via `POST /api/hub/v1/sessions/{session_id}/token`; Core binds a session to
+  the JTI of the token that created it. See `docs/architecture-boundary.md`.
