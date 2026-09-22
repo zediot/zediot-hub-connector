@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.7
+
+- Wait out a temporarily unavailable Core at startup instead of crash-restarting.
+  The startup calls to Core were bare: a timeout escaped `run_forever`, the
+  process exited and the container restart policy brought it back to collide
+  again. Observed in production at 06:55 on 2026-09-22: Core's database
+  connection pool was exhausted for several minutes, and the connector timed out
+  reading the authentication challenge (the enrollment check just before it had
+  succeeded) and crashed twice.
+- Both remaining startup calls — the enrollment check, and authentication plus
+  session creation — now go through `_call_while_core_unavailable`. Only
+  transport errors (timeouts, refused or reset connections), 5xx and 429 are
+  retried; rejected credentials and other 4xx still raise, because waiting will
+  not fix them. Backoff starts at 5s, doubles, and is capped at 60s: the
+  existing 300s binding-poll cap was designed for waiting on a user to enter a
+  claim code, and outages of this kind last minutes.
+- The wait uses the stop event, so SIGTERM during it returns immediately without
+  creating a session. Session recovery after startup already survived these
+  errors (every loop catches them and feeds the circuit breaker) and is
+  unchanged.
+- This is the third and last startup exit of the defect class fixed in 0.3.5
+  (held lease) and 0.3.6 (Home Assistant not up yet).
+
 ## 0.3.6
 
 - Do not crash when Home Assistant is not up yet at startup. The bootstrap
