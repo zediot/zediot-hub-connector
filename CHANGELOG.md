@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.5
+
+- Wait out a held session lease instead of crash-restarting. After a restart,
+  creating a session while the previous process's lease is still live returns
+  409 `active_lease_conflict`. The connector only called `raise_for_status()`,
+  so the error escaped `run_forever`, the process exited, the container restart
+  policy brought it back, and it collided again after a cold start. Observed in
+  production: 7 rejections between 08:16 and 08:19 on 2026-09-19, about 30s
+  apart — the cadence of cold starts — each one adding a
+  `connector_clone_suspected` audit, while Core knew the answer from the first
+  rejection.
+- Core now returns `active_lease_expires_at` and `retry_after_seconds` with that
+  409. The connector recognises it (`HubLeaseConflictError`), waits
+  `retry_after_seconds + 1` in place and retries. The extra second covers Core's
+  `lease_expires_at < now` check landing a few milliseconds early on a whole-second
+  boundary. Older Core versions that send only the message string get a fixed
+  30s wait; hints are capped at 600s so a bogus value cannot park the connector
+  for hours.
+- Only that conflict is waited out. Other 409s on the same endpoint (contract
+  mismatch, inactive integration instance) will not heal by waiting and still
+  raise.
+- The wait uses the stop event, so SIGTERM during it returns immediately without
+  another attempt. Startup and session recovery share `_establish_session`, so
+  both paths are covered.
+
 ## 0.3.4
 
 - Rebind the live session whenever the access token is rotated. Core binds a
