@@ -1502,3 +1502,115 @@ def test_inventory_loop_backfills_the_missed_startup_snapshot(tmp_path: Path):
     assert home_assistant.collect_calls == 3
     assert runtime._bootstrap_snapshot_pending is False
 
+
+class CoreBriefBlackout(FakeCore):
+    """Core 暂时不可用：前几次请求失败，之后恢复。现网是数据库连接池耗尽导致读超时。"""
+
+    def __init__(self, *, failing_calls, error_factory, fail_on="authenticate"):
+        super().__init__()
+        self.failing_calls = failing_calls
+        self.error_factory = error_factory
+        self.fail_on = fail_on
+        self.calls = {"authenticate": 0, "enrollment_status": 0}
+
+    def _maybe_fail(self, name):
+        self.calls[name] += 1
+        if name == self.fail_on and self.calls[name] <= self.failing_calls:
+            raise self.error_factory()
+
+    def authenticate(self, identity):
+        self._maybe_fail("authenticate")
+
+    def enrollment_status(self, *, enrollment_id, exchange_receipt):
+        self._maybe_fail("enrollment_status")
+        return {"status": "approved"}
+
+
+def _read_timeout():
+    return httpx.ReadTimeout("The read operation timed out")
+
+
+def _http_status(code):
+    def _make():
+        request = httpx.Request("POST", "https://core.example/api/hub/v1/auth/challenges")
+        return httpx.HTTPStatusError(
+            f"{code}", request=request, response=httpx.Response(code, request=request)
+        )
+    return _make
+
+
+def test_core_read_timeout_while_going_live_is_retried_not_fatal(tmp_path: Path):
+    """启动时认证读超时：等一会重试，而不是让异常冒出 run_forever。
+
+    现网 2026-09-22 06:55：Core 数据库连接池耗尽几分钟，AIBox 连接器在认证这一步
+    读超时，异常冒出去、进程退出、容器重启，连崩 2 次。
+    """
+    core = CoreBriefBlackout(failing_calls=2, error_factory=_read_timeout)
+    runtime = _lease_runtime(tmp_path, core)
+    runtime.stop_event = RecordingStopEvent()
+
+    runtime._go_live(_lease_identity())  # 修复前：ReadTimeout 从这里冒出去
+
+    assert core.calls["authenticate"] == 3
+    assert runtime.stop_event.waits == [5.0, 10.0], "5 秒起、翻倍"
+    assert runtime.session is not None
+
+
+def test_core_5xx_and_429_are_retried(tmp_path: Path):
+    for code in (503, 429):
+        core = CoreBriefBlackout(failing_calls=1, error_factory=_http_status(code))
+        runtime = _lease_runtime(tmp_path / str(code), core)
+        runtime.stop_event = RecordingStopEvent()
+
+        runtime._go_live(_lease_identity())
+
+        assert core.calls["authenticate"] == 2, code
+        assert runtime.session is not None, code
+
+
+def test_rejected_credentials_still_fail_fast(tmp_path: Path):
+    """凭据被拒（403）等多久都不会好：照旧抛出，不能被重试逻辑吞掉。"""
+    core = CoreBriefBlackout(failing_calls=99, error_factory=_http_status(403))
+    runtime = _lease_runtime(tmp_path, core)
+    runtime.stop_event = RecordingStopEvent()
+
+    with pytest.raises(httpx.HTTPStatusError):
+        runtime._go_live(_lease_identity())
+    assert core.calls["authenticate"] == 1
+    assert runtime.stop_event.waits == []
+
+
+def test_retry_backoff_is_capped(tmp_path: Path):
+    core = CoreBriefBlackout(failing_calls=6, error_factory=_read_timeout)
+    runtime = _lease_runtime(tmp_path, core)
+    runtime.stop_event = RecordingStopEvent()
+
+    runtime._go_live(_lease_identity())
+
+    assert runtime.stop_event.waits == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0]
+
+
+def test_stop_while_core_is_unavailable_exits_cleanly(tmp_path: Path):
+    core = CoreBriefBlackout(failing_calls=99, error_factory=_read_timeout)
+    runtime = _lease_runtime(tmp_path, core)
+    runtime.stop_event = RecordingStopEvent(stop_during_wait=True)
+
+    runtime._go_live(_lease_identity())
+
+    assert core.calls["authenticate"] == 1
+    assert runtime.session is None
+
+
+def test_enrollment_check_timeout_at_startup_is_retried(tmp_path: Path):
+    """配对路径启动时先查注册状态，这一步读超时同样不能把进程带崩。"""
+    core = CoreBriefBlackout(
+        failing_calls=1, error_factory=_read_timeout, fail_on="enrollment_status"
+    )
+    runtime = _lease_runtime(tmp_path, core)
+    runtime.stop_event = RecordingStopEvent()
+
+    runtime._prepare_existing(_lease_identity())
+
+    assert core.calls["enrollment_status"] == 2
+    assert runtime.session is not None
+

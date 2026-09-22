@@ -7,6 +7,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
+
 from zediot_ha_hub_connector.config import ConnectorConfig
 from zediot_ha_hub_connector.event_identity import build_source_event_id
 from zediot_ha_hub_connector.command_executor import HubCommandExecutor
@@ -161,10 +163,15 @@ class HubConnectorRuntime:
             return
         if not identity.enrollment_id or not identity.exchange_receipt:
             raise RuntimeError("HUB_ENROLLMENT_STATE_INVALID")
-        status = self.core.enrollment_status(
-            enrollment_id=identity.enrollment_id,
-            exchange_receipt=identity.exchange_receipt,
+        completed, status = self._call_while_core_unavailable(
+            lambda: self.core.enrollment_status(
+                enrollment_id=identity.enrollment_id,
+                exchange_receipt=identity.exchange_receipt,
+            ),
+            step="checking enrollment",
         )
+        if not completed:
+            return  # 等待期间被要求停止
         if status["status"] != "approved":
             raise RuntimeError(f"HUB_APPROVAL_{status['status'].upper()}")
         self.identity = identity
@@ -369,8 +376,42 @@ class HubConnectorRuntime:
 
     def _go_live(self, identity: ConnectorIdentity) -> None:
         self.binding_state = BINDING_READY
-        self.core.authenticate(identity)
-        self._establish_session(identity)
+
+        def _authenticate_and_connect() -> None:
+            self.core.authenticate(identity)
+            self._establish_session(identity)
+
+        self._call_while_core_unavailable(_authenticate_and_connect, step="going live")
+
+    def _call_while_core_unavailable(self, action: Any, *, step: str) -> tuple[bool, Any]:
+        """执行 action；Core 暂时不可用就等一会再试，别让进程崩掉。
+
+        返回 (完成与否, action 的返回值)。等待期间被要求停止时返回 (False, None)。
+
+        启动路径上对 Core 的请求原先裸调：Core 超时，异常冒出 run_forever，进程
+        退出，容器按重启策略拉起，冷启动完再撞一次。现网 2026-09-22 06:55：Core 的
+        数据库连接池耗尽了几分钟，AIBox 连接器在认证这一步读超时，连崩 2 次。与
+        0.3.5（租约冲突）、0.3.6（HA 没起来）是同一类缺陷的第三个出口。
+
+        只有「暂时不可用」才重试（见 _core_temporarily_unavailable）；凭据被拒这类
+        4xx 重试解决不了，照旧抛出。
+        """
+        delay = self.config.binding_poll_initial_seconds
+        while True:
+            try:
+                return True, action()
+            except Exception as error:  # noqa: BLE001
+                if not _core_temporarily_unavailable(error):
+                    raise
+                logger.warning(
+                    "Core temporarily unavailable while %s (%s); retrying in %.0fs",
+                    step,
+                    type(error).__name__,
+                    delay,
+                )
+                if self.stop_event.wait(delay):
+                    return False, None
+                delay = min(delay * 2, _CORE_RETRY_MAX_SECONDS)
 
     def _establish_session(self, identity: ConnectorIdentity) -> None:
         # 会话建立成功即证明 Core 放行了数据面（GW-09 的服务端门禁在此之前）。
@@ -1040,6 +1081,21 @@ def _stable_runtime_id(prefix: str, value: str) -> str:
 _LEASE_CONFLICT_FALLBACK_SECONDS = 30.0
 # Core 给的秒数也设上限：一个异常的大值不该让连接器静默挂上几个小时。
 _LEASE_CONFLICT_MAX_WAIT_SECONDS = 600.0
+
+
+# Core 暂时不可用时，启动路径的重试间隔上限。数据库连接池那类故障持续几分钟，
+# 等太久只会让恢复之后白白空等。
+_CORE_RETRY_MAX_SECONDS = 60.0
+
+
+def _core_temporarily_unavailable(error: Exception) -> bool:
+    """超时、连不上、连接被重置、5xx、429：等一会就可能好。其余 4xx 不会。"""
+    if isinstance(error, httpx.TransportError):
+        return True
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        return status >= 500 or status == 429
+    return False
 
 
 def _lease_conflict_wait_seconds(retry_after_seconds: float | None) -> float:
