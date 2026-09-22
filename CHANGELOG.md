@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.6
+
+- Do not crash when Home Assistant is not up yet at startup. The bootstrap
+  snapshot was called bare in `run_forever`: with Home Assistant not yet
+  listening on 8123 the websocket connection was refused, the
+  `ConnectionRefusedError` escaped `run_forever`, the process exited, and the
+  container restart policy brought it back to collide again. Observed in
+  production on 2026-09-22: after the AIBox host rebooted, the connector came up
+  before Home Assistant and crashed 5 times before Home Assistant was ready,
+  opening and handing back a session each time.
+- A missed startup snapshot is now recorded and backfilled by the inventory loop,
+  which already wakes every heartbeat interval (30s). The backfill keeps
+  `run_type=bootstrap` and clears only once it succeeds. Command, rule and state
+  subscription threads already tolerated Home Assistant being unreachable; the
+  startup snapshot was the one step that did not.
+- Same class of defect as 0.3.5 — a transient startup error taking the whole
+  process down — in a different place.
+
 ## 0.3.5
 
 - Wait out a held session lease instead of crash-restarting. After a restart,
