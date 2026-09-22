@@ -34,6 +34,32 @@ class HubActivationError(RuntimeError):
         self.terminal = terminal
 
 
+class HubLeaseConflictError(RuntimeError):
+    """建会话时，上一份会话的租约还没过期（Core 409 `active_lease_conflict`）。
+
+    这不是故障，是「上一个进程的会话还活着」—— 重启、容器重建、异常退出之后
+    重连，撞上的都是它。它也不是终态：租约一到期就能接管。
+
+    Core 在响应里给出租约到期时刻与 `retry_after_seconds`，照着等就行。原先这里
+    只有 `raise_for_status()`，异常一路冒出 `run_forever`，进程退出、容器重启、
+    再撞一次：现网 09-19 08:16–08:19 被拒 7 次，间隔约 30 秒，正是一次次冷启动的
+    节奏，而 Core 从第一次拒绝起就知道答案。
+
+    旧版 Core 只回一句字符串，没有秒数；那时 `retry_after_seconds` 为 None，
+    由调用方用保守的固定间隔。
+    """
+
+    def __init__(
+        self,
+        *,
+        retry_after_seconds: float | None,
+        lease_expires_at: datetime | None,
+    ) -> None:
+        super().__init__("HUB_ACTIVE_LEASE_CONFLICT")
+        self.retry_after_seconds = retry_after_seconds
+        self.lease_expires_at = lease_expires_at
+
+
 class HubSessionInvalidError(RuntimeError):
     """The server rejected a session that must be re-established."""
 
@@ -501,6 +527,9 @@ class IoTCoreHubClient:
                 session_id=_session_id_from_path(path),
                 detail=invalid_session,
             )
+        lease_conflict = _lease_conflict(response, path=path)
+        if lease_conflict is not None:
+            raise lease_conflict
         response.raise_for_status()
         body = response.json()
         return dict(body.get("data") or {})
@@ -547,6 +576,56 @@ def _invalid_session_detail(
     }:
         return detail
     return None
+
+
+_LEGACY_LEASE_CONFLICT_DETAIL = "Hub connector already has an active session lease"
+
+
+def _lease_conflict(
+    response: httpx.Response,
+    *,
+    path: str,
+) -> HubLeaseConflictError | None:
+    """建会话的 409 里，只认「租约冲突」这一种。
+
+    同一个端点的 409 还有别的含义（契约版本不符、集成实例未激活），那些不是等
+    一会就能好的，照旧交给 raise_for_status。所以按 reason_code / 原文精确匹配，
+    不按状态码一概而论。
+    """
+    if path != "/api/hub/v1/sessions" or response.status_code != 409:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, str):
+        # 旧版 Core：只有一句话，没有秒数。
+        if data == _LEGACY_LEASE_CONFLICT_DETAIL:
+            return HubLeaseConflictError(
+                retry_after_seconds=None, lease_expires_at=None
+            )
+        return None
+    if not isinstance(data, dict) or data.get("reason_code") != "active_lease_conflict":
+        return None
+    retry_after = data.get("retry_after_seconds")
+    retry_after_seconds = (
+        float(retry_after)
+        if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool)
+        and retry_after >= 0
+        else None
+    )
+    expires_raw = data.get("active_lease_expires_at")
+    lease_expires_at: datetime | None = None
+    if isinstance(expires_raw, str):
+        try:
+            lease_expires_at = _parse_time(expires_raw)
+        except ValueError:
+            lease_expires_at = None
+    return HubLeaseConflictError(
+        retry_after_seconds=retry_after_seconds,
+        lease_expires_at=lease_expires_at,
+    )
 
 
 def _session_id_from_path(path: str) -> str:

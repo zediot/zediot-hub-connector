@@ -14,6 +14,7 @@ from zediot_ha_hub_connector.command_store import CommandReceiptStore
 from zediot_ha_hub_connector.core_client import (
     HubActivationError,
     HubSession,
+    HubLeaseConflictError,
     HubSessionInvalidError,
     IoTCoreHubClient,
 )
@@ -374,10 +375,30 @@ class HubConnectorRuntime:
         # 把 READY 设在这里而不是 _go_live，是因为会话恢复路径也走这里——
         # 设在别处会让一次重连之后自己把自己挡在门外。
         self.binding_state = BINDING_READY
-        self.session = self.core.connect_session(
-            identity=identity,
-            resume_cursor=self.cursor,
-        )
+        while True:
+            try:
+                self.session = self.core.connect_session(
+                    identity=identity,
+                    resume_cursor=self.cursor,
+                )
+                break
+            except HubLeaseConflictError as conflict:
+                # 上一个进程的会话还没到期。原地等到期再接管，而不是让异常冒出
+                # run_forever：那会退出进程、靠容器重启再撞一次，每次冷启动都在
+                # Core 审计里多一条 connector_clone_suspected。
+                wait_seconds = _lease_conflict_wait_seconds(
+                    conflict.retry_after_seconds
+                )
+                logger.info(
+                    "Hub session lease still held by the previous session; "
+                    "reconnecting in %.0fs (lease_expires_at=%s)",
+                    wait_seconds,
+                    conflict.lease_expires_at.isoformat()
+                    if conflict.lease_expires_at
+                    else "unknown",
+                )
+                if self.stop_event.wait(wait_seconds):
+                    return  # 等待期间被要求停止：不建会话，run_forever 会自己收尾
         self.local_rule_runtime = None
         if self.session.allows(_GRANT_LOCAL_RULE_RUNTIME):
             self.local_rule_runtime = HomeAssistantLocalRuleRuntime(
@@ -982,6 +1003,21 @@ def _source_event_id(
 def _stable_runtime_id(prefix: str, value: str) -> str:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
     return f"{prefix}_{digest}"
+
+
+# 旧版 Core 的 409 不带秒数时的等待。取租约的一个量级，而不是立刻重试：
+# 短了只是多撞几次，长了最多晚一个周期接管。
+_LEASE_CONFLICT_FALLBACK_SECONDS = 30.0
+# Core 给的秒数也设上限：一个异常的大值不该让连接器静默挂上几个小时。
+_LEASE_CONFLICT_MAX_WAIT_SECONDS = 600.0
+
+
+def _lease_conflict_wait_seconds(retry_after_seconds: float | None) -> float:
+    if retry_after_seconds is None:
+        return _LEASE_CONFLICT_FALLBACK_SECONDS
+    # 多等 1 秒：Core 判「已过期」用的是 lease_expires_at < now，卡在整秒边界上
+    # 再撞一次正好还差几毫秒。
+    return min(max(retry_after_seconds, 0.0) + 1.0, _LEASE_CONFLICT_MAX_WAIT_SECONDS)
 
 
 def _retryable_core_error(error: Exception) -> bool:

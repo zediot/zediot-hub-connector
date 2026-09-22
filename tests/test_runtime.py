@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from zediot_ha_hub_connector.config import ConnectorConfig
 from zediot_ha_hub_connector.core_client import (
+    HubLeaseConflictError,
     HubSession,
     HubSessionInvalidError,
 )
@@ -1295,3 +1296,118 @@ def test_runtime_clean_shutdown_disconnects_the_active_lease(tmp_path: Path):
     assert runtime.session is None
     assert len(core.disconnects) == 1
     assert core.disconnects[0]["reason_code"] == "connector_sigterm"
+
+
+class LeaseHeldFakeCore(FakeCore):
+    """第一次建会话撞上旧租约，之后成功。"""
+
+    def __init__(self, *, retry_after_seconds):
+        super().__init__()
+        self.retry_after_seconds = retry_after_seconds
+        self.connect_attempts = 0
+
+    def connect_session(self, *, identity, resume_cursor):
+        self.connect_attempts += 1
+        if self.connect_attempts == 1:
+            raise HubLeaseConflictError(
+                retry_after_seconds=self.retry_after_seconds,
+                lease_expires_at=None,
+            )
+        return super().connect_session(identity=identity, resume_cursor=resume_cursor)
+
+
+class RecordingStopEvent:
+    def __init__(self, *, stop_during_wait=False):
+        self.waits = []
+        self.stop_during_wait = stop_during_wait
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        return self.stop_during_wait
+
+    def is_set(self):
+        return self.stop_during_wait and bool(self.waits)
+
+
+def _lease_runtime(tmp_path: Path, core) -> HubConnectorRuntime:
+    config = ConnectorConfig(
+        core_url="https://core.example",
+        display_name="Test",
+        installation_id="install-1",
+        pairing_code=None,
+        ha_websocket_url="ws://supervisor/core/websocket",
+        ha_access_token="supervisor",
+        ha_auth_mode="supervisor",
+        runtime_kind="home_assistant_addon",
+        state_dir=tmp_path,
+        retry_base_seconds=0,
+    )
+    return HubConnectorRuntime(
+        config,
+        core=core,
+        home_assistant=FakeHomeAssistant(),
+        sleep=lambda _seconds: None,
+    )
+
+
+def _lease_identity() -> ConnectorIdentity:
+    return ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr_1",
+        connector_id="hub_1",
+        credential_id="hcred_1",
+        exchange_receipt="receipt",
+    )
+
+
+def test_held_lease_is_waited_out_instead_of_crashing_the_process(tmp_path: Path):
+    """撞上旧租约时按 Core 给的秒数原地等，然后接管 —— 不能让异常冒出 run_forever。
+
+    现网：异常冒出去、进程退出、容器重启再撞，09-19 被拒 7 次，每次冷启动都在
+    Core 审计里多一条 connector_clone_suspected。
+    """
+    core = LeaseHeldFakeCore(retry_after_seconds=187)
+    runtime = _lease_runtime(tmp_path, core)
+    runtime.stop_event = RecordingStopEvent()
+
+    runtime._establish_session(_lease_identity())
+
+    assert core.connect_attempts == 2, "等完之后应当再试一次并成功"
+    assert runtime.stop_event.waits == [188.0], "按 retry_after_seconds 等，多留 1 秒余量"
+    assert runtime.session is not None
+
+
+def test_held_lease_without_a_hint_falls_back_to_a_bounded_wait(tmp_path: Path):
+    """旧版 Core 不给秒数：用固定间隔，而不是立刻重试。"""
+    core = LeaseHeldFakeCore(retry_after_seconds=None)
+    runtime = _lease_runtime(tmp_path, core)
+    runtime.stop_event = RecordingStopEvent()
+
+    runtime._establish_session(_lease_identity())
+
+    assert runtime.stop_event.waits == [30.0]
+    assert runtime.session is not None
+
+
+def test_absurd_wait_hint_is_capped(tmp_path: Path):
+    """一个异常的大值不该让连接器静默挂上几个小时。"""
+    core = LeaseHeldFakeCore(retry_after_seconds=86_400)
+    runtime = _lease_runtime(tmp_path, core)
+    runtime.stop_event = RecordingStopEvent()
+
+    runtime._establish_session(_lease_identity())
+
+    assert runtime.stop_event.waits == [600.0]
+
+
+def test_stop_during_lease_wait_exits_without_another_attempt(tmp_path: Path):
+    """等待期间收到 SIGTERM：立刻停，不再建会话，也不能卡到租约到期。"""
+    core = LeaseHeldFakeCore(retry_after_seconds=187)
+    runtime = _lease_runtime(tmp_path, core)
+    runtime.stop_event = RecordingStopEvent(stop_during_wait=True)
+
+    runtime._establish_session(_lease_identity())
+
+    assert core.connect_attempts == 1
+    assert runtime.session is None
+

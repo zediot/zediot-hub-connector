@@ -8,6 +8,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from zediot_ha_hub_connector.core_client import (
+    HubLeaseConflictError,
     HubSessionInvalidError,
     IoTCoreHubClient,
 )
@@ -448,3 +449,73 @@ def test_binding_mismatch_403_asks_for_a_fresh_session():
             circuit_state="closed",
         )
     assert excinfo.value.session_id == "hsess-1"
+
+
+def _session_client(response: httpx.Response) -> IoTCoreHubClient:
+    client = IoTCoreHubClient(
+        base_url="https://core.example",
+        client=httpx.Client(transport=httpx.MockTransport(lambda _r: response)),
+    )
+    client._token = "test-token"
+    client._token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    return client
+
+
+def _identity() -> ConnectorIdentity:
+    return ConnectorIdentity(
+        private_key=Ed25519PrivateKey.generate(),
+        enrollment_id="henr-1",
+        connector_id="hub-1",
+        credential_id="hcred-1",
+        exchange_receipt="receipt-1",
+    )
+
+
+def test_active_lease_conflict_carries_how_long_to_wait():
+    """Core 告诉我们上一份会话的租约什么时候到期，这个信息必须传到调用方。
+
+    原先这里只有 raise_for_status：异常冒出 run_forever，进程退出、容器重启、
+    再撞一次（现网 09-19 被拒 7 次，间隔约 30 秒）。
+    """
+    client = _session_client(
+        httpx.Response(
+            409,
+            json={
+                "data": {
+                    "detail": "Hub connector already has an active session lease",
+                    "reason_code": "active_lease_conflict",
+                    "active_lease_expires_at": "2026-09-19T08:19:26+00:00",
+                    "retry_after_seconds": 187,
+                }
+            },
+        )
+    )
+    with pytest.raises(HubLeaseConflictError) as conflict:
+        client.connect_session(identity=_identity(), resume_cursor=None)
+    assert conflict.value.retry_after_seconds == 187
+    assert conflict.value.lease_expires_at == datetime(
+        2026, 9, 19, 8, 19, 26, tzinfo=timezone.utc
+    )
+
+
+def test_legacy_core_lease_conflict_is_still_recognised_without_a_wait_hint():
+    """旧版 Core 只回一句字符串。仍然要认出来，只是没有秒数可用。"""
+    client = _session_client(
+        httpx.Response(
+            409, json={"data": "Hub connector already has an active session lease"}
+        )
+    )
+    with pytest.raises(HubLeaseConflictError) as conflict:
+        client.connect_session(identity=_identity(), resume_cursor=None)
+    assert conflict.value.retry_after_seconds is None
+    assert conflict.value.lease_expires_at is None
+
+
+def test_other_session_create_conflicts_are_not_mistaken_for_a_lease_wait():
+    """同一端点的其他 409（契约不符、实例未激活）等多久都不会好，不能当租约冲突去等。"""
+    client = _session_client(
+        httpx.Response(409, json={"data": "Hub session contract mismatch"})
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        client.connect_session(identity=_identity(), resume_cursor=None)
+
