@@ -14,7 +14,7 @@ from zediot_ha_hub_connector.core_client import (
     HubSessionInvalidError,
 )
 from zediot_ha_hub_connector.ha_client import HomeAssistantSnapshot
-from zediot_ha_hub_connector.identity import ConnectorIdentity
+from zediot_ha_hub_connector.identity import BINDING_READY, ConnectorIdentity
 from zediot_ha_hub_connector.runtime import HubConnectorRuntime
 from zediot_ha_hub_connector.snapshot import build_snapshot_uplink
 
@@ -1410,4 +1410,95 @@ def test_stop_during_lease_wait_exits_without_another_attempt(tmp_path: Path):
 
     assert core.connect_attempts == 1
     assert runtime.session is None
+
+
+class HomeAssistantNotUpYet(FakeHomeAssistant):
+    """前几次采快照时 HA 还没在监听 —— 整机重启后连接器先于 HA 起来就是这样。"""
+
+    def __init__(self, *, refusals):
+        self.refusals = refusals
+        self.collect_calls = 0
+
+    def collect_snapshot(self):
+        self.collect_calls += 1
+        if self.collect_calls <= self.refusals:
+            raise ConnectionRefusedError(111, "Connection refused")
+        return super().collect_snapshot()
+
+
+class StopAfterWaits:
+    """wait() 前 n 次返回 False（继续循环），之后返回 True（停止）。"""
+
+    def __init__(self, n):
+        self.remaining = n
+        self.waits = []
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        if self.remaining > 0:
+            self.remaining -= 1
+            return False
+        return True
+
+    def is_set(self):
+        return False
+
+    def set(self):
+        pass
+
+
+def _snapshot_runtime(tmp_path: Path, home_assistant) -> HubConnectorRuntime:
+    runtime = _lease_runtime(tmp_path, FakeCore())
+    runtime.home_assistant = home_assistant
+    runtime.session = HubSession(
+        session_id="hsess_1",
+        integration_instance_id="int_test",
+        lease_generation=1,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=240),
+        resume_cursor=None,
+        effective_grants=frozenset({"inventory_read", "state_uplink"}),
+    )
+    return runtime
+
+
+def test_home_assistant_not_up_at_startup_does_not_crash_the_process(tmp_path: Path):
+    """HA 还没起来时，run_forever 不能因为启动快照而抛出去。
+
+    现网 2026-09-22：AIBox 整机重启，连接器先于 HA 起来，启动快照连接被拒，
+    异常冒出 run_forever，进程退出、容器重启，连崩 5 次才等到 HA。
+    """
+    home_assistant = HomeAssistantNotUpYet(refusals=1)
+    runtime = _snapshot_runtime(tmp_path, home_assistant)
+    runtime.prepare = lambda: None
+    runtime.binding_state = BINDING_READY  # prepare() 正常走完后的状态
+    runtime._runtime_threads = lambda: []
+    runtime.stop_event = StopAfterWaits(0)
+
+    runtime.run_forever()  # 修复前：ConnectionRefusedError 从这里冒出去
+
+    assert home_assistant.collect_calls == 1
+    assert runtime._bootstrap_snapshot_pending is True, "没采到的启动快照要留着补"
+
+
+def test_inventory_loop_backfills_the_missed_startup_snapshot(tmp_path: Path):
+    """补采走对账线程，run_type 仍是 bootstrap，补上之后不再重复。"""
+    home_assistant = HomeAssistantNotUpYet(refusals=2)
+    runtime = _snapshot_runtime(tmp_path, home_assistant)
+    run_types = []
+    original = runtime.enqueue_snapshot
+
+    def _recording(*, run_type):
+        run_types.append(run_type)
+        return original(run_type=run_type)
+
+    runtime.enqueue_snapshot = _recording
+    runtime._bootstrap_snapshot_pending = True
+    assert runtime._try_bootstrap_snapshot() is False  # 启动时：被拒一次
+
+    runtime.stop_event = StopAfterWaits(2)
+    runtime._inventory_loop()  # 第一轮再被拒，第二轮补上
+
+    assert run_types == ["bootstrap", "bootstrap", "bootstrap"]
+    assert home_assistant.collect_calls == 3
+    assert runtime._bootstrap_snapshot_pending is False
 

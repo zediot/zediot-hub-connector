@@ -102,6 +102,8 @@ class HubConnectorRuntime:
         self.stop_event = threading.Event()
         self._shutdown_reason_code = "connector_shutdown"
         self._session_lock = threading.Lock()
+        # 启动快照没采到（HA 还没起来）时置位，由 _inventory_loop 补采。
+        self._bootstrap_snapshot_pending = False
         self.identity: ConnectorIdentity | None = None
         self.session: HubSession | None = None
         self.local_rule_runtime: HomeAssistantLocalRuleRuntime | None = None
@@ -442,6 +444,29 @@ class HubConnectorRuntime:
             kind="snapshot",
             payload=payload,
         )
+
+    def _try_bootstrap_snapshot(self) -> bool:
+        """启动快照。采不到就留给对账线程补，不能把进程带崩。
+
+        原先它裸调在 run_forever 里：HA 没在监听时 websocket 连接被拒，异常冒出
+        run_forever，进程退出，容器按重启策略拉起，冷启动完再撞一次。现网
+        2026-09-22 AIBox 整机重启：连接器比 Home Assistant 先起来，这样崩了 5 次
+        才等到 HA 就绪 —— 每次还要白建一个会话再交还。
+
+        HA 没起来是启动期的常态，不是故障。命令、规则、状态订阅那几条线程本来
+        就各自容忍 HA 暂时不可达，唯独这一步没有。
+        """
+        try:
+            self.enqueue_snapshot(run_type="bootstrap")
+        except Exception as error:  # noqa: BLE001
+            logger.warning(
+                "Home Assistant snapshot unavailable at startup (%s); "
+                "retrying from the inventory loop",
+                type(error).__name__,
+            )
+            return False
+        self._bootstrap_snapshot_pending = False
+        return True
 
     def enqueue_reconciliation_if_needed(self, *, force: bool = False) -> bool:
         if self.session and not self.session.allows(_GRANT_INVENTORY_READ):
@@ -797,7 +822,8 @@ class HubConnectorRuntime:
             if self.stop_event.is_set():
                 return
             if self.session and self.session.allows(_GRANT_INVENTORY_READ):
-                self.enqueue_snapshot(run_type="bootstrap")
+                self._bootstrap_snapshot_pending = True
+                self._try_bootstrap_snapshot()
             threads = self._runtime_threads()
             for thread in threads:
                 thread.start()
@@ -948,6 +974,10 @@ class HubConnectorRuntime:
         while not self.stop_event.wait(self.config.heartbeat_interval_seconds):
             try:
                 if not (self.session and self.session.allows(_GRANT_INVENTORY_READ)):
+                    continue
+                if self._bootstrap_snapshot_pending:
+                    # 启动时 HA 还没起来：先把那次启动快照补上，常规对账下一轮再说。
+                    self._try_bootstrap_snapshot()
                     continue
                 due = (
                     time.monotonic() - last_reconciliation
